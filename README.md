@@ -59,12 +59,11 @@ Configuration:
 ## Development
 
 ```sh
-make test
-make lint
-make build
+just test
+just lint
+just build
 ```
 
 Linux and macOS are supported. The first runtime driver is `host`. Persistence
 covers CLI and daemon restarts; process shims are not automatically restored
 after a machine reboot.
-
