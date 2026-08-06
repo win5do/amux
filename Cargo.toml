@@ -1,0 +1,52 @@
+[package]
+name = "amux"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Persistent process and TTY runtime for AI agents"
+
+[lib]
+name = "amux"
+path = "src/lib.rs"
+
+[[bin]]
+name = "amux"
+path = "src/bin/amux.rs"
+
+[[bin]]
+name = "amuxd"
+path = "src/bin/amuxd.rs"
+
+[[bin]]
+name = "amux-shim"
+path = "src/bin/amux-shim.rs"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["ws", "json"] }
+base64 = "0.22"
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+libc = "0.2"
+nix = { version = "0.30", features = ["process", "signal"] }
+portable-pty = "0.9"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-tungstenite = "0.27"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
