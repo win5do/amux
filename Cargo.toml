@@ -1,9 +1,14 @@
 [package]
 name = "amux-runtime"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2024"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 description = "Persistent process and TTY runtime for AI agents"
+repository = "https://github.com/win5do/amux"
+documentation = "https://docs.rs/amux-runtime"
+readme = "README.md"
+keywords = ["agent", "terminal", "tty", "process", "runtime"]
+categories = ["command-line-utilities", "development-tools"]
 
 [lib]
 name = "amux"
