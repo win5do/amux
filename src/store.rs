@@ -278,6 +278,16 @@ impl Store {
             {
                 return Ok(process);
             }
+        } else {
+            let mut named = processes
+                .into_iter()
+                .filter(|process| process.name == target);
+            if let Some(process) = named.next() {
+                if named.next().is_some() {
+                    bail!("process name is ambiguous; use workspace/name")
+                }
+                return Ok(process);
+            }
         }
         bail!("process not found")
     }
@@ -375,5 +385,25 @@ mod tests {
             )
             .unwrap();
         assert_eq!(store.find_process("dev/api").unwrap().id, process.id);
+        assert_eq!(store.find_process("api").unwrap().id, process.id);
+
+        let other = store
+            .create_workspace(CreateWorkspaceRequest {
+                name: "other".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .create_process(
+                &other,
+                RunRequest {
+                    name: "api".into(),
+                    command: vec!["true".into()],
+                    ..Default::default()
+                },
+                "boot".into(),
+            )
+            .unwrap();
+        assert!(store.find_process("api").is_err());
     }
 }

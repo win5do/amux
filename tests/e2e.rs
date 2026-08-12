@@ -49,6 +49,23 @@ fn ok(state: &Path, socket: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
+fn ok_in_workspace(state: &Path, socket: &Path, workspace: &str, args: &[&str]) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_amux"))
+        .env("AMUX_STATE_DIR", state)
+        .env("AMUX_SOCKET", socket)
+        .env("AMUX_WORKSPACE", workspace)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{:?}: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
 #[tokio::test]
 async fn pipe_lifecycle_and_daemon_recovery() {
     let _guard = E2E_LOCK.lock().await;
@@ -58,6 +75,14 @@ async fn pipe_lifecycle_and_daemon_recovery() {
     let mut first = daemon(&state, &socket);
 
     ok(&state, &socket, &["workspace", "create", "dev"]);
+    ok_in_workspace(
+        &state,
+        &socket,
+        "dev",
+        &["run", "--name", "defaulted", "--", "/usr/bin/true"],
+    );
+    ok(&state, &socket, &["wait", "dev/defaulted"]);
+    ok(&state, &socket, &["rm", "dev/defaulted"]);
     ok(
         &state,
         &socket,

@@ -27,6 +27,10 @@ The CLI starts `amuxd` automatically when its Unix socket is absent. During
 attach, `Ctrl-P Ctrl-Q` detaches without terminating the process. Pipe output
 is read with `amux logs`; it is never exposed as a fake terminal.
 
+Inside an amux-managed process, `AMUX_WORKSPACE` supplies the default for
+`amux run --workspace` and `amux shell --workspace`. This lets an enclosing
+workspace manager select an isolated runtime without wrapping the amux CLI.
+
 Managed processes receive trusted `AMUX`, `AMUX_WORKSPACE`,
 `AMUX_WORKSPACE_ID`, `AMUX_PROCESS`, `AMUX_PROCESS_ID`, and `AMUX_IO_MODE`
 variables. Nested attach from a managed process is rejected.
@@ -55,6 +59,11 @@ Configuration:
 - `AMUX_STATE_DIR`: persistent metadata and output logs.
 - `AMUX_SOCKET`: daemon Unix socket.
 - State directories are mode `0700`; sockets and state files are mode `0600`.
+
+The distributable Codex Skill lives at [`skills/amux`](skills/amux). Install or
+link that directory as `amux` in the active Codex skills home. Treefold-managed
+Sessions can use the same Skill directly because Treefold injects its private
+`AMUX_STATE_DIR`, `AMUX_SOCKET`, and `AMUX_WORKSPACE`.
 
 ## Development
 

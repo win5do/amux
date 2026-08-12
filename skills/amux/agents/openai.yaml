@@ -1,0 +1,4 @@
+interface:
+  display_name: "amux"
+  short_description: "Manage persistent processes, logs, and TTYs"
+  default_prompt: "Use $amux to run and inspect persistent workspace processes."

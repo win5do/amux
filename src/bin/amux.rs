@@ -80,7 +80,7 @@ enum Command {
         target: String,
     },
     Shell {
-        #[arg(short, long)]
+        #[arg(short, long, env = "AMUX_WORKSPACE")]
         workspace: String,
         #[arg(long, default_value = "shell")]
         name: String,
@@ -111,7 +111,7 @@ enum WorkspaceCommand {
 
 #[derive(Args)]
 struct RunArgs {
-    #[arg(short, long)]
+    #[arg(short, long, env = "AMUX_WORKSPACE")]
     workspace: String,
     #[arg(long)]
     name: String,
