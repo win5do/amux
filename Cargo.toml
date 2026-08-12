@@ -1,5 +1,5 @@
 [package]
-name = "amux"
+name = "amux-runtime"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
