@@ -38,6 +38,7 @@ use crate::{
     config::{Config, boot_id},
     model::*,
     protocol::Response,
+    shim::Shim,
     store::Store,
     unix_http,
 };
@@ -47,16 +48,44 @@ pub struct Daemon {
     config: Config,
     store: Arc<Store>,
     shim_path: Arc<PathBuf>,
+    shim_args: Arc<Vec<String>>,
+    embedded_shims: bool,
 }
 
 impl Daemon {
     pub fn new(config: Config) -> Result<Self> {
-        let store = Arc::new(Store::open(&config.state_dir)?);
         let shim_path = sibling_executable("amux-shim")?;
+        Self::with_shim_command(config, shim_path, Vec::new())
+    }
+
+    /// Creates a daemon that launches shims through an arbitrary executable.
+    ///
+    /// Embedders can point this at their own executable and use `shim_args` to
+    /// select a hidden shim entry point, avoiding a separately bundled binary.
+    pub fn with_shim_command(
+        config: Config,
+        shim_path: PathBuf,
+        shim_args: Vec<String>,
+    ) -> Result<Self> {
+        let store = Arc::new(Store::open(&config.state_dir)?);
         Ok(Self {
             config,
             store,
             shim_path: Arc::new(shim_path),
+            shim_args: Arc::new(shim_args),
+            embedded_shims: false,
+        })
+    }
+
+    /// Creates a daemon whose shims run as tasks in the daemon process.
+    /// Intended for tests; embedded shims do not survive their host process.
+    pub fn with_embedded_shims(config: Config) -> Result<Self> {
+        Ok(Self {
+            store: Arc::new(Store::open(&config.state_dir)?),
+            config,
+            shim_path: Arc::new(PathBuf::new()),
+            shim_args: Arc::new(Vec::new()),
+            embedded_shims: true,
         })
     }
 
@@ -181,8 +210,23 @@ impl Daemon {
         process.runtime_handle = socket.to_string_lossy().into_owned();
         self.store.save_process(process)?;
         let path = self.shim_path.clone();
+        let args = self.shim_args.clone();
         let dir = self.store.process_dir(&process.workspace_id, &process.id);
-        tokio::task::spawn_blocking(move || launch_detached(&path, &dir, &socket)).await??;
+        if self.embedded_shims {
+            let shim = Shim::load(dir, socket)?;
+            tokio::spawn(async move {
+                let _ = shim.serve(None).await;
+            });
+        } else {
+            tokio::task::spawn_blocking(move || launch_detached(&path, &args, &dir, &socket))
+                .await??;
+        }
+        for _ in 0..100 {
+            if self.shim_status(process).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         *process = self.shim_status(process).await?;
         Ok(())
     }
@@ -857,7 +901,7 @@ fn sibling_executable(name: &str) -> Result<PathBuf> {
     bail!("find {name}: executable not found")
 }
 
-fn launch_detached(shim: &Path, dir: &Path, socket: &Path) -> Result<()> {
+fn launch_detached(shim: &Path, shim_args: &[String], dir: &Path, socket: &Path) -> Result<()> {
     let mut fds = [0i32; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
         return Err(std::io::Error::last_os_error().into());
@@ -872,6 +916,7 @@ fn launch_detached(shim: &Path, dir: &Path, socket: &Path) -> Result<()> {
     let stderr = log.try_clone()?;
     let mut command = Command::new(shim);
     command
+        .args(shim_args)
         .args([
             "--process-dir",
             &dir.to_string_lossy(),
