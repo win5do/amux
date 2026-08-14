@@ -1,8 +1,9 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fs::{self, OpenOptions},
+    future::IntoFuture,
     os::{
-        fd::RawFd,
+        fd::{FromRawFd, RawFd},
         unix::{
             fs::{OpenOptionsExt, PermissionsExt},
             process::CommandExt,
@@ -10,7 +11,10 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -26,19 +30,21 @@ use axum::{
     response::{IntoResponse, Response as AxumResponse},
     routing::{any, get, post},
 };
+use base64::Engine;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::{BodyExt, Full};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{Notify, broadcast};
+use tokio_stream::wrappers::BroadcastStream;
 use tokio_tungstenite::{client_async, tungstenite};
 
 use crate::{
     config::{Config, boot_id},
     model::*,
     protocol::Response,
-    shim::Shim,
     store::Store,
     unix_http,
 };
@@ -50,12 +56,26 @@ pub struct Daemon {
     shim_path: Arc<PathBuf>,
     shim_args: Arc<Vec<String>>,
     embedded_shims: bool,
+    instance_id: Arc<String>,
+    events: Arc<Mutex<EventHub>>,
+    event_tx: broadcast::Sender<ProcessEvent>,
+    shutdown: Arc<Notify>,
+    group_lifelines: Arc<Mutex<BTreeMap<String, fs::File>>>,
+    last_request: Arc<AtomicU64>,
+}
+
+const EVENT_BUFFER_LIMIT: usize = 4096;
+
+struct EventHub {
+    sequence: u64,
+    buffer: VecDeque<ProcessEvent>,
+    fingerprints: BTreeMap<String, String>,
 }
 
 impl Daemon {
     pub fn new(config: Config) -> Result<Self> {
-        let shim_path = sibling_executable("amux-shim")?;
-        Self::with_shim_command(config, shim_path, Vec::new())
+        let executable = std::env::current_exe().context("locate amux executable")?;
+        Self::with_shim_command(config, executable, vec!["daemon".into(), "shim".into()])
     }
 
     /// Creates a daemon that launches shims through an arbitrary executable.
@@ -67,25 +87,47 @@ impl Daemon {
         shim_path: PathBuf,
         shim_args: Vec<String>,
     ) -> Result<Self> {
-        let store = Arc::new(Store::open(&config.state_dir)?);
+        let store = Arc::new(Store::deferred(&config.state_dir));
+        let (event_tx, _) = broadcast::channel(EVENT_BUFFER_LIMIT);
         Ok(Self {
             config,
             store,
             shim_path: Arc::new(shim_path),
             shim_args: Arc::new(shim_args),
             embedded_shims: false,
+            instance_id: Arc::new(uuid::Uuid::new_v4().to_string()),
+            events: Arc::new(Mutex::new(EventHub {
+                sequence: 0,
+                buffer: VecDeque::new(),
+                fingerprints: BTreeMap::new(),
+            })),
+            event_tx,
+            shutdown: Arc::new(Notify::new()),
+            group_lifelines: Arc::new(Mutex::new(BTreeMap::new())),
+            last_request: Arc::new(AtomicU64::new(now_seconds())),
         })
     }
 
     /// Creates a daemon whose shims run as tasks in the daemon process.
     /// Intended for tests; embedded shims do not survive their host process.
     pub fn with_embedded_shims(config: Config) -> Result<Self> {
+        let (event_tx, _) = broadcast::channel(EVENT_BUFFER_LIMIT);
         Ok(Self {
-            store: Arc::new(Store::open(&config.state_dir)?),
+            store: Arc::new(Store::deferred(&config.state_dir)),
             config,
             shim_path: Arc::new(PathBuf::new()),
             shim_args: Arc::new(Vec::new()),
             embedded_shims: true,
+            instance_id: Arc::new(uuid::Uuid::new_v4().to_string()),
+            events: Arc::new(Mutex::new(EventHub {
+                sequence: 0,
+                buffer: VecDeque::new(),
+                fingerprints: BTreeMap::new(),
+            })),
+            event_tx,
+            shutdown: Arc::new(Notify::new()),
+            group_lifelines: Arc::new(Mutex::new(BTreeMap::new())),
+            last_request: Arc::new(AtomicU64::new(now_seconds())),
         })
     }
 
@@ -100,7 +142,19 @@ impl Daemon {
         if !parent_existed {
             fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
         }
-        let lock_path = parent.join("amuxd.lock");
+        let state_parent = self
+            .config
+            .state_dir
+            .parent()
+            .context("state directory has no parent")?;
+        fs::create_dir_all(state_parent)?;
+        let state_name = self
+            .config
+            .state_dir
+            .file_name()
+            .context("state directory has no name")?
+            .to_string_lossy();
+        let lock_path = state_parent.join(format!(".{state_name}.lock"));
         let lock = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -117,6 +171,7 @@ impl Daemon {
         {
             bail!("another amuxd owns the socket")
         }
+        self.store.ensure_schema()?;
         let _ = fs::remove_file(&self.config.socket);
         let listener = UnixListener::bind(&self.config.socket)?;
         fs::set_permissions(&self.config.socket, fs::Permissions::from_mode(0o600))?;
@@ -124,8 +179,16 @@ impl Daemon {
             write_ready(fd);
         }
 
+        self.write_registration()?;
+        let monitor = self.clone();
+        tokio::spawn(async move { monitor.monitor_processes().await });
+        let idle = self.clone();
+        tokio::spawn(async move { idle.monitor_idle().await });
         let app = Router::new()
-            .route("/v1/health", get(|| async { Json(json!({"ok":true})) }))
+            .route("/v1/health", get(health))
+            .route("/v1/processes/snapshot", get(process_snapshot))
+            .route("/v1/processes/events", get(process_events))
+            .route("/v1/admin/stop", post(stop_daemon))
             .route(
                 "/v1/workspaces",
                 get(list_workspaces).post(create_workspace),
@@ -176,54 +239,96 @@ impl Daemon {
             )
             .route("/v1/groups", get(list_groups))
             .route("/v1/environments", get(list_environments))
+            .layer(axum::middleware::from_fn_with_state(
+                self.clone(),
+                track_activity,
+            ))
             .with_state(self.clone());
-        let result = axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
-            .await;
+        let stopping = self.shutdown.clone();
+        let server = axum::serve(listener, app).into_future();
+        tokio::pin!(server);
+        let result = tokio::select! {
+            value = &mut server => value,
+            _ = async move { tokio::select! { _ = shutdown_signal() => {}, _ = stopping.notified() => {} } } => Ok(()),
+        };
+        self.stop_all_processes().await;
+        self.group_lifelines.lock().unwrap().clear();
         let _ = fs::remove_file(&self.config.socket);
+        let _ = fs::remove_file(self.config.state_dir.join("daemon.json"));
         drop(lock);
         result?;
         Ok(())
     }
 
     fn shim_socket(&self, process: &Process) -> PathBuf {
-        if !process.runtime_handle.is_empty() {
-            return PathBuf::from(&process.runtime_handle);
-        }
         PathBuf::from(format!(
             "/tmp/amux-{}/shims/{}.sock",
             unsafe { libc::getuid() },
-            process.id
+            process.group_id
         ))
     }
 
     async fn shim_status(&self, process: &Process) -> Result<Process> {
-        let value: Process =
-            unix_http::json_request(&self.shim_socket(process), Method::GET, "/v1/status", None)
-                .await?;
-        self.store.save_process(&value)?;
+        let value: Process = unix_http::json_request(
+            &self.shim_socket(process),
+            Method::GET,
+            &format!("/v1/processes/{}/status", process.id),
+            None,
+        )
+        .await?;
         Ok(value)
     }
 
     async fn launch_shim(&self, process: &mut Process) -> Result<()> {
         let socket = self.shim_socket(process);
-        process.runtime_handle = socket.to_string_lossy().into_owned();
+        process.runtime_handle.clear();
         self.store.save_process(process)?;
         let path = self.shim_path.clone();
         let args = self.shim_args.clone();
-        let dir = self.store.process_dir(&process.workspace_id, &process.id);
-        if self.embedded_shims {
-            let shim = Shim::load(dir, socket)?;
-            tokio::spawn(async move {
-                let _ = shim.serve(None).await;
-            });
-        } else {
-            tokio::task::spawn_blocking(move || launch_detached(&path, &args, &dir, &socket))
+        let process_dir = self.store.process_dir(&process.workspace_id, &process.id);
+        let workspace_dir = self.store.workspace_dir(&process.workspace_id);
+        if !socket.exists() {
+            if self.embedded_shims {
+                let group = crate::shim::GroupShim::load(&workspace_dir, &socket)?;
+                tokio::spawn(async move {
+                    let _ = group.serve(None, None).await;
+                });
+                for _ in 0..100 {
+                    if socket.exists() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            } else {
+                let (group_id, lifeline) = tokio::task::spawn_blocking(move || {
+                    launch_detached(&path, &args, &workspace_dir, &socket)
+                })
                 .await??;
+                self.group_lifelines
+                    .lock()
+                    .unwrap()
+                    .insert(group_id, lifeline);
+            }
         }
+        unix_http::json_request::<serde_json::Value>(
+            &self.shim_socket(process),
+            Method::POST,
+            "/v1/processes",
+            Some(Bytes::from(serde_json::to_vec(
+                &json!({"process_dir": process_dir}),
+            )?)),
+        )
+        .await?;
         for _ in 0..100 {
-            if self.shim_status(process).await.is_ok() {
-                break;
+            if let Ok(value) = self.shim_status(process).await {
+                *process = value;
+                return Ok(());
+            }
+            if let Ok(value) = self.store.find_process(&process.id)
+                && value.state.terminal()
+            {
+                *process = value;
+                return Ok(());
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -248,6 +353,274 @@ impl Daemon {
             target,
         }
     }
+
+    fn write_registration(&self) -> Result<()> {
+        fs::create_dir_all(&self.config.state_dir)?;
+        crate::store::atomic_json(
+            &self.config.state_dir.join("daemon.json"),
+            &json!({
+                "schema_version": SCHEMA_VERSION,
+                "name": std::env::var("AMUX_DAEMON").unwrap_or_else(|_| "default".into()),
+                "instance_id": self.instance_id.as_str(),
+                "pid": std::process::id(),
+                "socket": self.config.socket,
+                "state_dir": self.config.state_dir,
+                "version": env!("CARGO_PKG_VERSION"),
+                "started_at": chrono::Utc::now(),
+                "active_groups": 0,
+                "active_processes": 0,
+            }),
+        )
+    }
+
+    fn emit(&self, kind: ProcessEventKind, process: Process) {
+        let view = self.view(process.clone());
+        let fingerprint = serde_json::to_string(&process).unwrap_or_default();
+        let event = {
+            let mut hub = self.events.lock().unwrap();
+            hub.sequence += 1;
+            hub.fingerprints.insert(process.id.clone(), fingerprint);
+            let event = ProcessEvent {
+                kind,
+                daemon_instance_id: self.instance_id.as_ref().clone(),
+                sequence: hub.sequence,
+                timestamp: chrono::Utc::now(),
+                workspace_id: process.workspace_id.clone(),
+                group_id: process.group_id.clone(),
+                process_id: process.id.clone(),
+                parent_process_id: process.parent_process_id.clone(),
+                execution: process.execution,
+                process: view,
+            };
+            hub.buffer.push_back(event.clone());
+            while hub.buffer.len() > EVENT_BUFFER_LIMIT {
+                hub.buffer.pop_front();
+            }
+            event
+        };
+        let _ = self.event_tx.send(event);
+        self.update_registration_counts();
+    }
+
+    fn update_registration_counts(&self) {
+        let path = self.config.state_dir.join("daemon.json");
+        let Ok(mut value) = crate::store::read_json::<serde_json::Value>(&path) else {
+            return;
+        };
+        let active = self
+            .store
+            .list_processes(None)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| !p.state.terminal())
+            .collect::<Vec<_>>();
+        let groups = active
+            .iter()
+            .map(|p| &p.group_id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        value["active_processes"] = json!(active.len());
+        value["active_groups"] = json!(groups);
+        let _ = crate::store::atomic_json(&path, &value);
+    }
+
+    async fn monitor_processes(&self) {
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if !self.config.socket.exists() {
+                continue;
+            }
+            for mut process in self.store.list_processes(None).unwrap_or_default() {
+                if !process.state.terminal()
+                    && let Ok(current) = self.shim_status(&process).await
+                {
+                    process = current;
+                }
+                let fingerprint = serde_json::to_string(&process).unwrap_or_default();
+                let changed =
+                    self.events.lock().unwrap().fingerprints.get(&process.id) != Some(&fingerprint);
+                if changed {
+                    let kind = if process.state.terminal() {
+                        ProcessEventKind::ProcessExited
+                    } else if process.state == ProcessState::Running {
+                        ProcessEventKind::ProcessStarted
+                    } else {
+                        ProcessEventKind::ProcessUpdated
+                    };
+                    self.emit(kind, process);
+                }
+            }
+        }
+    }
+
+    async fn monitor_idle(&self) {
+        loop {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let active = self
+                .store
+                .list_processes(None)
+                .unwrap_or_default()
+                .iter()
+                .any(|p| !p.state.terminal());
+            if !active
+                && now_seconds().saturating_sub(self.last_request.load(Ordering::Relaxed)) >= 300
+            {
+                self.shutdown.notify_waiters();
+                break;
+            }
+        }
+    }
+
+    async fn stop_all_processes(&self) {
+        let processes = self.store.list_processes(None).unwrap_or_default();
+        for process in &processes {
+            if !process.state.terminal() {
+                let body = Bytes::from(
+                    serde_json::to_vec(&StopRequest {
+                        grace_millis: 10_000,
+                    })
+                    .unwrap(),
+                );
+                let _ = unix_http::json_request::<serde_json::Value>(
+                    &self.shim_socket(process),
+                    Method::POST,
+                    &format!("/v1/processes/{}/stop", process.id),
+                    Some(body),
+                )
+                .await;
+            }
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(11);
+        while tokio::time::Instant::now() < deadline {
+            if processes.iter().all(|p| {
+                self.store
+                    .find_process(&p.id)
+                    .map(|v| v.state.terminal())
+                    .unwrap_or(true)
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
+async fn track_activity(
+    State(daemon): State<Daemon>,
+    request: Request<Body>,
+    next: axum::middleware::Next,
+) -> AxumResponse {
+    daemon.last_request.store(now_seconds(), Ordering::Relaxed);
+    next.run(request).await
+}
+
+fn now_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+async fn health(State(daemon): State<Daemon>) -> Json<serde_json::Value> {
+    Json(
+        json!({"ok": true, "daemon_instance_id": daemon.instance_id.as_str(), "schema_version": SCHEMA_VERSION}),
+    )
+}
+
+async fn stop_daemon(State(daemon): State<Daemon>) -> Json<serde_json::Value> {
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        daemon.shutdown.notify_waiters();
+    });
+    Json(json!({"ok": true}))
+}
+
+async fn process_snapshot(State(daemon): State<Daemon>) -> AxumResponse {
+    let hub = daemon.events.lock().unwrap();
+    let snapshot = ProcessSnapshot {
+        daemon_instance_id: daemon.instance_id.as_ref().clone(),
+        sequence: hub.sequence,
+        processes: daemon
+            .store
+            .list_processes(None)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| daemon.view(p))
+            .collect(),
+    };
+    Json(snapshot).into_response()
+}
+
+#[derive(Default, Deserialize)]
+struct EventQuery {
+    #[serde(default)]
+    after: u64,
+    instance: Option<String>,
+}
+
+async fn process_events(
+    State(daemon): State<Daemon>,
+    Query(query): Query<EventQuery>,
+) -> AxumResponse {
+    let (initial, receiver) = {
+        let hub = daemon.events.lock().unwrap();
+        if query
+            .instance
+            .as_deref()
+            .is_some_and(|v| v != daemon.instance_id.as_str())
+        {
+            return api_error(
+                StatusCode::CONFLICT,
+                "resync_required",
+                "daemon instance changed",
+            );
+        }
+        let oldest = hub
+            .buffer
+            .front()
+            .map(|e| e.sequence)
+            .unwrap_or(hub.sequence.saturating_add(1));
+        if query.after.saturating_add(1) < oldest {
+            return api_error(
+                StatusCode::CONFLICT,
+                "resync_required",
+                "event cursor is outside the replay buffer",
+            );
+        }
+        if query.after > hub.sequence {
+            return api_error(
+                StatusCode::CONFLICT,
+                "resync_required",
+                "event cursor is ahead of the daemon",
+            );
+        }
+        (
+            hub.buffer
+                .iter()
+                .filter(|e| e.sequence > query.after)
+                .cloned()
+                .collect::<Vec<_>>(),
+            daemon.event_tx.subscribe(),
+        )
+    };
+    let initial = tokio_stream::iter(
+        initial
+            .into_iter()
+            .filter_map(|event| serde_json::to_vec(&event).ok())
+            .map(|mut line| {
+                line.push(b'\n');
+                Ok::<_, std::convert::Infallible>(Bytes::from(line))
+            }),
+    );
+    let follow =
+        tokio_stream::StreamExt::filter_map(BroadcastStream::new(receiver), |item| match item {
+            Ok(event) => serde_json::to_vec(&event).ok().map(|mut line| {
+                line.push(b'\n');
+                Ok::<_, std::convert::Infallible>(Bytes::from(line))
+            }),
+            Err(_) => None,
+        });
+    Body::from_stream(tokio_stream::StreamExt::chain(initial, follow)).into_response()
 }
 
 async fn list_workspaces(State(daemon): State<Daemon>) -> AxumResponse {
@@ -332,6 +705,15 @@ async fn run_process(
             anyhow!("name and command are required"),
         );
     }
+    if let Some(parent_id) = request.parent_process_id.as_deref()
+        && daemon.store.find_process(parent_id).is_err()
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_parent_process",
+            "parent process does not belong to this daemon",
+        );
+    }
     if !request.runtime.is_empty() && request.runtime != workspace.runtime {
         return api_error(
             StatusCode::BAD_REQUEST,
@@ -362,6 +744,7 @@ async fn run_process(
             );
         }
     };
+    daemon.emit(ProcessEventKind::ProcessCreated, process.clone());
     runtime_env.extend([
         ("AMUX".into(), "1".into()),
         ("AMUX_WORKSPACE".into(), workspace.name.clone()),
@@ -387,6 +770,7 @@ async fn run_process(
             error,
         );
     }
+    daemon.emit(ProcessEventKind::ProcessStarted, process.clone());
     let mut response = Response::ok();
     response.process = Some(daemon.view(process));
     (StatusCode::CREATED, Json(response)).into_response()
@@ -445,11 +829,18 @@ async fn process_route(
     };
     match action {
         Some("attach") => return proxy_attach(daemon, process, request).await,
+        Some("logs") if process.state.terminal() && !daemon.shim_socket(&process).exists() => {
+            return historical_logs(&daemon, &process, request.uri().query()).unwrap_or_else(|e| {
+                api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e)
+            });
+        }
         Some("logs") | Some("signal") | Some("stop") => {
             return proxy_http(&daemon, &process, action.unwrap(), request).await;
         }
         Some("wait") => loop {
             if let Ok(value) = daemon.shim_status(&process).await {
+                process = value;
+            } else if let Ok(value) = daemon.store.find_process(&process.id) {
                 process = value;
             }
             if process.state.terminal() {
@@ -484,12 +875,58 @@ async fn process_route(
             }
             shutdown_shim(&daemon, &process).await;
             match daemon.store.remove_process(&process) {
-                Ok(()) => Json(json!({"ok":true})).into_response(),
+                Ok(()) => {
+                    daemon.emit(ProcessEventKind::ProcessRemoved, process);
+                    Json(json!({"ok":true})).into_response()
+                }
                 Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e),
             }
         }
         _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
     }
+}
+
+fn historical_logs(
+    daemon: &Daemon,
+    process: &Process,
+    query: Option<&str>,
+) -> Result<AxumResponse> {
+    let after = query
+        .and_then(|q| q.split('&').find_map(|part| part.strip_prefix("after=")))
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let dir = daemon.store.process_dir(&process.workspace_id, &process.id);
+    let mut output = Vec::new();
+    if let Ok(file) = fs::File::open(dir.join("events.jsonl")) {
+        use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+        for line in BufReader::new(file).lines().map_while(std::io::Result::ok) {
+            let Ok(mut event) = serde_json::from_str::<OutputEvent>(&line) else {
+                continue;
+            };
+            if event.sequence <= after {
+                continue;
+            }
+            let mut raw = fs::File::open(dir.join(format!("{}.log", event.stream)))?;
+            raw.seek(SeekFrom::Start(event.offset as u64))?;
+            let mut bytes = vec![0; event.length];
+            raw.read_exact(&mut bytes)?;
+            event.data = Some(match String::from_utf8(bytes.clone()) {
+                Ok(text) => EncodedData {
+                    encoding: "utf8".into(),
+                    text,
+                    base64: String::new(),
+                },
+                Err(_) => EncodedData {
+                    encoding: "base64".into(),
+                    text: String::new(),
+                    base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                },
+            });
+            serde_json::to_writer(&mut output, &event)?;
+            output.push(b'\n');
+        }
+    }
+    Ok(Body::from(output).into_response())
 }
 
 async fn process_base_encoded(
@@ -629,7 +1066,10 @@ async fn proxy_http(
     };
     let req = match Request::builder()
         .method(method)
-        .uri(format!("http://unix/v1/{action}{query}"))
+        .uri(format!(
+            "http://unix/v1/processes/{}/{action}{query}",
+            process.id
+        ))
         .header("content-type", "application/json")
         .body(Full::new(bytes))
     {
@@ -697,6 +1137,7 @@ async fn restart_process(daemon: Daemon, mut process: Process) -> AxumResponse {
             error,
         );
     }
+    daemon.emit(ProcessEventKind::ProcessStarted, process.clone());
     let mut response = Response::ok();
     response.process = Some(daemon.view(process));
     Json(response).into_response()
@@ -726,7 +1167,7 @@ async fn remove_workspace(
             let _ = unix_http::json_request::<serde_json::Value>(
                 &daemon.shim_socket(process),
                 Method::POST,
-                "/v1/stop",
+                &format!("/v1/processes/{}/stop", process.id),
                 Some(Bytes::from(body)),
             )
             .await;
@@ -802,7 +1243,7 @@ async fn proxy_attach(daemon: Daemon, process: Process, request: Request<Body>) 
         Err(e) => return e.into_response(),
     };
     let socket = daemon.shim_socket(&process);
-    let path = format!("ws://unix/v1/attach{query}");
+    let path = format!("ws://unix/v1/processes/{}/attach{query}", process.id);
     let stream = match UnixStream::connect(socket).await {
         Ok(v) => v,
         Err(e) => return api_error(StatusCode::CONFLICT, "process_not_running", e),
@@ -884,26 +1325,22 @@ fn api_error(status: StatusCode, code: &str, error: impl std::fmt::Display) -> A
     (status, Json(Response::fail(code, error.to_string()))).into_response()
 }
 
-fn sibling_executable(name: &str) -> Result<PathBuf> {
-    if let Ok(current) = std::env::current_exe() {
-        let path = current.with_file_name(name);
-        if path.is_file() {
-            return Ok(path);
-        }
-    }
-    if let Some(path) = std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|p| p.join(name))
-            .find(|p| p.is_file())
-    }) {
-        return Ok(path);
-    }
-    bail!("find {name}: executable not found")
-}
-
-fn launch_detached(shim: &Path, shim_args: &[String], dir: &Path, socket: &Path) -> Result<()> {
+fn launch_detached(
+    shim: &Path,
+    shim_args: &[String],
+    workspace_dir: &Path,
+    socket: &Path,
+) -> Result<(String, fs::File)> {
     let mut fds = [0i32; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut lifecycle = [0i32; 2];
+    if unsafe { libc::pipe(lifecycle.as_mut_ptr()) } != 0 {
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
         return Err(std::io::Error::last_os_error().into());
     }
     let read_fd = fds[0];
@@ -912,23 +1349,26 @@ fn launch_detached(shim: &Path, shim_args: &[String], dir: &Path, socket: &Path)
         .create(true)
         .append(true)
         .mode(0o600)
-        .open(dir.join("shim.log"))?;
+        .open(workspace_dir.join("shim.log"))?;
     let stderr = log.try_clone()?;
     let mut command = Command::new(shim);
     command
         .args(shim_args)
         .args([
-            "--process-dir",
-            &dir.to_string_lossy(),
+            "--workspace-dir",
+            &workspace_dir.to_string_lossy(),
             "--socket",
             &socket.to_string_lossy(),
         ])
         .env("AMUX_SHIM_READY_FD", write_fd.to_string())
+        .env("AMUX_SHIM_LIFECYCLE_FD", lifecycle[0].to_string())
         .stdin(Stdio::null())
         .stdout(log)
         .stderr(stderr);
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
+            libc::close(read_fd);
+            libc::close(lifecycle[1]);
             if libc::setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -938,6 +1378,7 @@ fn launch_detached(shim: &Path, shim_args: &[String], dir: &Path, socket: &Path)
     let mut child = command.spawn()?;
     unsafe {
         libc::close(write_fd);
+        libc::close(lifecycle[0]);
     }
     let mut byte = [0u8; 1];
     let mut poll = libc::pollfd {
@@ -955,6 +1396,9 @@ fn launch_detached(shim: &Path, shim_args: &[String], dir: &Path, socket: &Path)
         libc::close(read_fd);
     }
     if count != 1 {
+        unsafe {
+            libc::close(lifecycle[1]);
+        }
         let _ = child.kill();
         let _ = child.wait();
         bail!("shim readiness failed")
@@ -962,7 +1406,12 @@ fn launch_detached(shim: &Path, shim_args: &[String], dir: &Path, socket: &Path)
     std::thread::spawn(move || {
         let _ = child.wait();
     });
-    Ok(())
+    unsafe {
+        libc::fcntl(lifecycle[1], libc::F_SETFD, libc::FD_CLOEXEC);
+    }
+    let lifeline = unsafe { fs::File::from_raw_fd(lifecycle[1]) };
+    let group: Group = crate::store::read_json(workspace_dir.join("group.json"))?;
+    Ok((group.id, lifeline))
 }
 
 fn write_ready(fd: RawFd) {

@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -99,6 +99,8 @@ pub struct Process {
     pub group_id: String,
     pub environment_id: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_process_id: Option<String>,
     pub command: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub cwd: String,
@@ -176,6 +178,8 @@ pub struct CreateWorkspaceRequest {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RunRequest {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_process_id: Option<String>,
     pub command: Vec<String>,
     #[serde(default)]
     pub cwd: String,
@@ -189,6 +193,43 @@ pub struct RunRequest {
     pub initial_rows: u16,
     #[serde(default)]
     pub initial_cols: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ProcessEventKind {
+    #[serde(rename = "process.created")]
+    ProcessCreated,
+    #[serde(rename = "process.started")]
+    ProcessStarted,
+    #[serde(rename = "process.updated")]
+    ProcessUpdated,
+    #[serde(rename = "process.exited")]
+    ProcessExited,
+    #[serde(rename = "process.removed")]
+    ProcessRemoved,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessEvent {
+    #[serde(rename = "type")]
+    pub kind: ProcessEventKind,
+    pub daemon_instance_id: String,
+    pub sequence: u64,
+    pub timestamp: DateTime<Utc>,
+    pub workspace_id: String,
+    pub group_id: String,
+    pub process_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_process_id: Option<String>,
+    pub execution: u64,
+    pub process: ProcessView,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessSnapshot {
+    pub daemon_instance_id: String,
+    pub sequence: u64,
+    pub processes: Vec<ProcessView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

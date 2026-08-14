@@ -1,5 +1,6 @@
 use std::{
     io::{IsTerminal, Write},
+    path::PathBuf,
     time::Duration,
 };
 
@@ -20,12 +21,23 @@ use tokio_tungstenite::tungstenite::Message;
 struct Cli {
     #[arg(long, global = true)]
     json: bool,
+    #[arg(
+        long = "daemon",
+        global = true,
+        env = "AMUX_DAEMON",
+        default_value = "default"
+    )]
+    daemon_name: String,
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommand,
+    },
     Workspace {
         #[command(subcommand)]
         command: WorkspaceCommand,
@@ -86,6 +98,29 @@ enum Command {
         name: String,
         #[arg(long)]
         shell: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum DaemonCommand {
+    List,
+    Start {
+        name: Option<String>,
+    },
+    Status {
+        name: Option<String>,
+    },
+    Stop {
+        name: Option<String>,
+    },
+    #[command(hide = true)]
+    Serve,
+    #[command(hide = true)]
+    Shim {
+        #[arg(long)]
+        workspace_dir: PathBuf,
+        #[arg(long)]
+        socket: PathBuf,
     },
 }
 
@@ -154,9 +189,23 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
-    let client = Client::new(Config::load()?);
-    client.ensure_daemon().await?;
+    if let Command::Daemon { command } = &cli.command {
+        return run_daemon_command(command.clone(), &cli.daemon_name, cli.json).await;
+    }
+    let config = if std::env::var_os("AMUX_SOCKET").is_some() {
+        Config::load()?
+    } else {
+        Config::named(amux::config::state_root()?, &cli.daemon_name)?
+    };
+    let client = Client::named(config, &cli.daemon_name);
+    client
+        .ensure_daemon_with(
+            std::env::current_exe()?,
+            vec!["daemon".into(), "serve".into()],
+        )
+        .await?;
     match cli.command {
+        Command::Daemon { .. } => unreachable!(),
         Command::Workspace { command } => match command {
             WorkspaceCommand::Create {
                 name,
@@ -201,6 +250,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Run(args) => {
             let request = RunRequest {
                 name: args.name,
+                parent_process_id: std::env::var("AMUX_PROCESS_ID")
+                    .ok()
+                    .filter(|v| !v.is_empty()),
                 command: args.command,
                 cwd: args.cwd,
                 env: args.env.into_iter().collect(),
@@ -319,6 +371,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 .unwrap_or_else(|| "/bin/sh".into());
             let request = RunRequest {
                 name,
+                parent_process_id: std::env::var("AMUX_PROCESS_ID")
+                    .ok()
+                    .filter(|v| !v.is_empty()),
                 command: vec![shell],
                 io_mode: IoMode::Tty,
                 ..Default::default()
@@ -358,6 +413,108 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             );
             attach(client.attach(&path).await?, readonly, keys, &target).await?;
         }
+    }
+    Ok(())
+}
+
+async fn run_daemon_command(
+    command: DaemonCommand,
+    selected: &str,
+    json: bool,
+) -> anyhow::Result<()> {
+    use amux::daemon::Daemon;
+    match command {
+        DaemonCommand::Serve => {
+            let ready_fd = std::env::var("AMUX_DAEMON_READY_FD")
+                .ok()
+                .and_then(|v| v.parse().ok());
+            Daemon::new(Config::load()?)?.serve(ready_fd).await
+        }
+        DaemonCommand::Shim {
+            workspace_dir,
+            socket,
+        } => {
+            let ready_fd = std::env::var("AMUX_SHIM_READY_FD")
+                .ok()
+                .and_then(|v| v.parse().ok());
+            let lifecycle_fd = std::env::var("AMUX_SHIM_LIFECYCLE_FD")
+                .ok()
+                .and_then(|v| v.parse().ok());
+            amux::shim::GroupShim::load(workspace_dir, socket)?
+                .serve(ready_fd, lifecycle_fd)
+                .await
+        }
+        DaemonCommand::Start { name } => {
+            let name = name.as_deref().unwrap_or(selected);
+            let client = Client::named(Config::named(amux::config::state_root()?, name)?, name);
+            client
+                .ensure_daemon_with(
+                    std::env::current_exe()?,
+                    vec!["daemon".into(), "serve".into()],
+                )
+                .await?;
+            print_daemon_status(&client, name, json).await
+        }
+        DaemonCommand::Status { name } => {
+            let name = name.as_deref().unwrap_or(selected);
+            let client = Client::named(Config::named(amux::config::state_root()?, name)?, name);
+            if !client.ready().await {
+                anyhow::bail!("daemon {name} is not running")
+            }
+            print_daemon_status(&client, name, json).await
+        }
+        DaemonCommand::Stop { name } => {
+            let name = name.as_deref().unwrap_or(selected);
+            let client = Client::named(Config::named(amux::config::state_root()?, name)?, name);
+            if client.ready().await {
+                client.do_empty(Method::POST, "/v1/admin/stop").await?;
+            }
+            if json {
+                println!("{{\"ok\":true,\"name\":{}}}", serde_json::to_string(name)?);
+            } else {
+                println!("stopped {name}");
+            }
+            Ok(())
+        }
+        DaemonCommand::List => {
+            let root = amux::config::state_root()?.join("daemons");
+            let mut records = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(root) {
+                for entry in entries.flatten() {
+                    if let Ok(bytes) = std::fs::read(entry.path().join("daemon.json"))
+                        && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                    {
+                        records.push(value);
+                    }
+                }
+            }
+            if json {
+                println!("{}", serde_json::to_string(&records)?);
+            } else {
+                for value in records {
+                    println!(
+                        "{}\t{}\t{}",
+                        value["name"].as_str().unwrap_or("?"),
+                        value["pid"],
+                        value["instance_id"].as_str().unwrap_or("?")
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn print_daemon_status(client: &Client, name: &str, json: bool) -> anyhow::Result<()> {
+    let bytes = client.do_empty(Method::GET, "/v1/health").await?;
+    if json {
+        println!("{}", String::from_utf8_lossy(&bytes));
+    } else {
+        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        println!(
+            "{name}\trunning\t{}",
+            value["daemon_instance_id"].as_str().unwrap_or("?")
+        );
     }
     Ok(())
 }

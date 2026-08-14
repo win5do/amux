@@ -14,16 +14,17 @@ use tokio_tungstenite::tungstenite::Message;
 static E2E_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn daemon(state: &Path, socket: &Path) -> Child {
-    let child = Command::new(env!("CARGO_BIN_EXE_amuxd"))
+    let child = Command::new(env!("CARGO_BIN_EXE_amux"))
         .env("AMUX_STATE_DIR", state)
         .env("AMUX_SOCKET", socket)
+        .args(["daemon", "serve"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !socket.exists() {
-        assert!(Instant::now() < deadline, "daemon socket was not created");
+    while std::os::unix::net::UnixStream::connect(socket).is_err() {
+        assert!(Instant::now() < deadline, "daemon socket was not ready");
         thread::sleep(Duration::from_millis(20));
     }
     child
@@ -162,20 +163,17 @@ async fn pipe_lifecycle_and_daemon_recovery() {
         .unwrap();
     first.kill().unwrap();
     first.wait().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(12);
+    while unsafe { libc::kill(pid as i32, 0) } == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "business process survived daemon death"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
     let mut second = daemon(&state, &socket);
     let after = ok(&state, &socket, &["--json", "inspect", "dev/survivor"]);
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&after).unwrap()["process"]["pid"].as_i64(),
-        Some(pid)
-    );
-    assert!(after.contains("\"state\":\"running\""));
-
-    ok(
-        &state,
-        &socket,
-        &["stop", "--time", "100ms", "dev/survivor"],
-    );
-    ok(&state, &socket, &["wait", "dev/survivor"]);
+    assert!(after.contains("\"state\":\"exited\"") || after.contains("\"state\":\"failed\""));
     ok(&state, &socket, &["rm", "dev/survivor"]);
     ok(&state, &socket, &["rm", "dev/io"]);
     ok(&state, &socket, &["workspace", "rm", "dev"]);
@@ -288,6 +286,108 @@ async fn tty_attach_and_controller_ownership() {
     ok(&state, &socket, &["wait", "dev/follow"]);
     ok(&state, &socket, &["rm", "dev/follow"]);
     ok(&state, &socket, &["workspace", "rm", "dev"]);
+    daemon_process.kill().unwrap();
+    let _ = daemon_process.wait();
+}
+
+#[tokio::test]
+async fn group_reuse_parent_links_and_process_events() {
+    let _guard = E2E_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let socket = temp.path().join("amux.sock");
+    let mut daemon_process = daemon(&state, &socket);
+    ok(&state, &socket, &["workspace", "create", "dev"]);
+    let client = Client::new(Config {
+        state_dir: state.clone(),
+        socket: socket.clone(),
+    });
+    let snapshot: amux::model::ProcessSnapshot = serde_json::from_slice(
+        &client
+            .do_empty(http::Method::GET, "/v1/processes/snapshot")
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let mut events = client
+        .stream(&format!(
+            "/v1/processes/events?after={}&instance={}",
+            snapshot.sequence, snapshot.daemon_instance_id
+        ))
+        .await
+        .unwrap();
+    ok(
+        &state,
+        &socket,
+        &[
+            "run",
+            "--workspace",
+            "dev",
+            "--name",
+            "parent",
+            "--",
+            "/bin/sh",
+            "-c",
+            "sleep 30",
+        ],
+    );
+    let parent: serde_json::Value =
+        serde_json::from_str(&ok(&state, &socket, &["--json", "inspect", "dev/parent"])).unwrap();
+    let parent_id = parent["process"]["id"].as_str().unwrap().to_owned();
+    let child_output = Command::new(env!("CARGO_BIN_EXE_amux"))
+        .env("AMUX_STATE_DIR", &state)
+        .env("AMUX_SOCKET", &socket)
+        .env("AMUX_PROCESS_ID", &parent_id)
+        .env("AMUX_WORKSPACE", "dev")
+        .args(["run", "--name", "child", "--", "/bin/sh", "-c", "sleep 30"])
+        .output()
+        .unwrap();
+    assert!(
+        child_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&child_output.stderr)
+    );
+    let child: serde_json::Value =
+        serde_json::from_str(&ok(&state, &socket, &["--json", "inspect", "dev/child"])).unwrap();
+    assert_eq!(child["process"]["parent_process_id"], parent_id);
+    assert_eq!(child["process"]["group_id"], parent["process"]["group_id"]);
+    assert!(child["process"]["runtime_handle"].is_null());
+
+    let mut observed = Vec::new();
+    let mut pending = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while observed.len() < 4 && tokio::time::Instant::now() < deadline {
+        let Ok(Some(frame)) = tokio::time::timeout_at(deadline, events.frame()).await else {
+            break;
+        };
+        let bytes = frame.unwrap().into_data().unwrap_or_default();
+        pending.extend_from_slice(&bytes);
+        while let Some(index) = pending.iter().position(|v| *v == b'\n') {
+            let line = pending.drain(..=index).collect::<Vec<_>>();
+            if let Ok(event) = serde_json::from_slice::<amux::model::ProcessEvent>(&line) {
+                observed.push(event);
+            }
+        }
+    }
+    assert!(
+        observed
+            .windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence)
+    );
+    assert!(observed.iter().any(|event| event.process_id == parent_id
+        && matches!(event.kind, amux::model::ProcessEventKind::ProcessCreated)));
+    assert!(
+        observed
+            .iter()
+            .any(|event| event.parent_process_id.as_deref() == Some(&parent_id))
+    );
+
+    ok(&state, &socket, &["stop", "--time", "100ms", "dev/parent"]);
+    ok(&state, &socket, &["wait", "dev/parent"]);
+    let still_running = ok(&state, &socket, &["--json", "inspect", "dev/child"]);
+    assert!(still_running.contains("\"state\":\"running\""));
+    ok(&state, &socket, &["stop", "--time", "100ms", "dev/child"]);
+    ok(&state, &socket, &["wait", "dev/child"]);
     daemon_process.kill().unwrap();
     let _ = daemon_process.wait();
 }

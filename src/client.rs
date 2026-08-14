@@ -21,11 +21,22 @@ use crate::{config::Config, protocol::Response, unix_http};
 #[derive(Clone)]
 pub struct Client {
     pub config: Config,
+    daemon_name: String,
 }
 
 impl Client {
     pub fn new(config: Config) -> Self {
-        Self { config }
+        Self {
+            config,
+            daemon_name: crate::config::daemon_name(),
+        }
+    }
+
+    pub fn named(config: Config, daemon_name: impl Into<String>) -> Self {
+        Self {
+            config,
+            daemon_name: daemon_name.into(),
+        }
     }
 
     pub async fn do_json<T: serde::Serialize>(
@@ -90,6 +101,16 @@ impl Client {
     }
 
     pub async fn ensure_daemon(&self) -> Result<()> {
+        let executable = std::env::current_exe().context("locate amux executable")?;
+        self.ensure_daemon_with(executable, vec!["daemon".into(), "serve".into()])
+            .await
+    }
+
+    pub async fn ensure_daemon_with(
+        &self,
+        executable: PathBuf,
+        arguments: Vec<String>,
+    ) -> Result<()> {
         if self.ready().await {
             return Ok(());
         }
@@ -98,7 +119,6 @@ impl Client {
             &self.config.state_dir,
             std::fs::Permissions::from_mode(0o700),
         )?;
-        let daemon = sibling_executable("amuxd")?;
         let log = OpenOptions::new()
             .create(true)
             .append(true)
@@ -109,8 +129,12 @@ impl Client {
         if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
-        let mut command = Command::new(daemon);
+        let mut command = Command::new(executable);
         command
+            .args(arguments)
+            .env("AMUX_DAEMON", &self.daemon_name)
+            .env("AMUX_STATE_DIR", &self.config.state_dir)
+            .env("AMUX_SOCKET", &self.config.socket)
             .env("AMUX_DAEMON_READY_FD", fds[1].to_string())
             .stdin(Stdio::null())
             .stdout(log)
@@ -156,21 +180,4 @@ impl Client {
         }
         Ok(())
     }
-}
-
-fn sibling_executable(name: &str) -> Result<PathBuf> {
-    if let Ok(current) = std::env::current_exe() {
-        let path = current.with_file_name(name);
-        if path.is_file() {
-            return Ok(path);
-        }
-    }
-    if let Some(path) = std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|p| p.join(name))
-            .find(|p| p.is_file())
-    }) {
-        return Ok(path);
-    }
-    bail!("find {name}: executable not found")
 }

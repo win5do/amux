@@ -3,11 +3,12 @@
 `amux` is a persistent process and TTY runtime for AI agents, with seamless
 human attach. It is implemented entirely in Rust.
 
-A workspace is a durable logical context. Its processes are peers and remain
-owned by per-process shims when the CLI or daemon exits:
+A workspace is a durable logical context backed by a named daemon. Processes in
+the same physical workspace share a group shim while retaining independent
+supervisors, PTYs, logs, and process groups:
 
 ```text
-amux CLI -> amuxd -> one amux-shim per process -> OS process group
+amux CLI -> named daemon -> one group shim per workspace -> OS process groups
 ```
 
 ## Build and quick start
@@ -23,13 +24,15 @@ amux ps --workspace dev --json
 amux attach dev/shell
 ```
 
-The CLI starts `amuxd` automatically when its Unix socket is absent. During
+The CLI lazily starts the selected daemon when its Unix socket is absent. During
 attach, `Ctrl-P Ctrl-Q` detaches without terminating the process. Pipe output
 is read with `amux logs`; it is never exposed as a fake terminal.
 
 Inside an amux-managed process, `AMUX_WORKSPACE` supplies the default for
 `amux run --workspace` and `amux shell --workspace`. This lets an enclosing
 workspace manager select an isolated runtime without wrapping the amux CLI.
+`AMUX_PROCESS_ID` is also inherited: nested `amux run` and `amux shell`
+requests automatically record their parent process.
 
 Managed processes receive trusted `AMUX`, `AMUX_WORKSPACE`,
 `AMUX_WORKSPACE_ID`, `AMUX_PROCESS`, `AMUX_PROCESS_ID`, and `AMUX_IO_MODE`
@@ -38,6 +41,11 @@ variables. Nested attach from a managed process is rejected.
 Useful commands:
 
 ```sh
+amux daemon list
+amux daemon start work
+amux daemon status work
+amux --daemon work ps
+amux daemon stop work
 amux workspace ls
 amux ps --workspace dev
 amux inspect dev/api
@@ -56,14 +64,15 @@ amux workspace rm dev
 
 Configuration:
 
+- `AMUX_DAEMON`: selected daemon name (default: `default`).
 - `AMUX_STATE_DIR`: persistent metadata and output logs.
-- `AMUX_SOCKET`: daemon Unix socket.
+- `AMUX_SOCKET`: test/debug-only direct Unix socket override.
 - State directories are mode `0700`; sockets and state files are mode `0600`.
 
 The distributable Codex Skill lives at [`skills/amux`](skills/amux). Install or
 link that directory as `amux` in the active Codex skills home. Treefold-managed
-Sessions can use the same Skill directly because Treefold injects its private
-`AMUX_STATE_DIR`, `AMUX_SOCKET`, and `AMUX_WORKSPACE`.
+Sessions can use the same Skill directly because Treefold injects
+`AMUX_DAEMON`, `AMUX_WORKSPACE`, and `AMUX_PROCESS_ID`.
 
 ## Development
 
@@ -74,8 +83,8 @@ just build
 ```
 
 Linux and macOS are supported. The first runtime driver is `host`. Persistence
-covers CLI and daemon restarts; process shims are not automatically restored
-after a machine reboot.
+covers Treefold/CLI reconnects. Stopping or losing a daemon deliberately stops
+all of its group shims and business process groups.
 
 ## License
 

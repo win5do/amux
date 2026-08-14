@@ -21,12 +21,37 @@ pub struct Store {
 impl Store {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
-        fs::create_dir_all(root.join("workspaces"))?;
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
-        Ok(Self {
-            root,
+        let store = Self::deferred(root);
+        store.ensure_schema()?;
+        Ok(store)
+    }
+
+    pub(crate) fn deferred(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
             lock: Mutex::new(()),
-        })
+        }
+    }
+
+    pub(crate) fn ensure_schema(&self) -> Result<()> {
+        let _guard = self.lock.lock().unwrap();
+        let root = &self.root;
+        if root.exists() {
+            let valid = read_json::<serde_json::Value>(root.join("schema.json"))
+                .ok()
+                .and_then(|v| v.get("schema_version").and_then(|v| v.as_u64()))
+                == Some(SCHEMA_VERSION as u64);
+            if !valid {
+                fs::remove_dir_all(root).context("reset incompatible amux schema")?;
+            }
+        }
+        fs::create_dir_all(root.join("workspaces"))?;
+        fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
+        atomic_json(
+            &root.join("schema.json"),
+            &serde_json::json!({"schema_version": SCHEMA_VERSION}),
+        )?;
+        Ok(())
     }
 
     pub fn root(&self) -> &Path {
@@ -185,6 +210,7 @@ impl Store {
             group_id: group.id,
             environment_id: env.id,
             name: req.name,
+            parent_process_id: req.parent_process_id,
             command: req.command,
             cwd: req.cwd,
             env: req.env,
@@ -214,12 +240,18 @@ impl Store {
 
     pub fn save_process(&self, process: &Process) -> Result<()> {
         let _guard = self.lock.lock().unwrap();
-        atomic_json(
-            &self
-                .process_dir(&process.workspace_id, &process.id)
-                .join("metadata.json"),
-            process,
-        )
+        let path = self
+            .process_dir(&process.workspace_id, &process.id)
+            .join("metadata.json");
+        if let Ok(current) = read_json::<Process>(&path)
+            && (current.execution > process.execution
+                || (current.execution == process.execution
+                    && current.state.terminal()
+                    && !process.state.terminal()))
+        {
+            return Ok(());
+        }
+        atomic_json(&path, process)
     }
 
     pub fn save_runtime_env(

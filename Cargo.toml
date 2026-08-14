@@ -18,14 +18,6 @@ path = "src/lib.rs"
 name = "amux"
 path = "src/bin/amux.rs"
 
-[[bin]]
-name = "amuxd"
-path = "src/bin/amuxd.rs"
-
-[[bin]]
-name = "amux-shim"
-path = "src/bin/amux-shim.rs"
-
 [dependencies]
 anyhow = "1"
 axum = { version = "0.8", features = ["ws", "json"] }
@@ -44,6 +36,7 @@ portable-pty = "0.9"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }

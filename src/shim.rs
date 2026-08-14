@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     fs::{self, File},
+    future::IntoFuture,
     io::{BufRead, BufReader, Read, Write},
     os::unix::{fs::PermissionsExt, process::CommandExt},
     path::{Path, PathBuf},
@@ -14,7 +15,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{
-        Query, State, WebSocketUpgrade,
+        Path as AxumPath, Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     http::StatusCode,
@@ -67,6 +68,213 @@ pub struct Shim {
     output: broadcast::Sender<WireMessage>,
     readers: Arc<(Mutex<usize>, Condvar)>,
     shutdown: Arc<tokio::sync::Notify>,
+}
+
+#[derive(Clone)]
+pub struct GroupShim {
+    workspace_dir: PathBuf,
+    socket: PathBuf,
+    processes: Arc<Mutex<BTreeMap<String, Shim>>>,
+    shutdown: Arc<tokio::sync::Notify>,
+}
+
+#[derive(serde::Deserialize)]
+struct StartProcessRequest {
+    process_dir: PathBuf,
+}
+
+impl GroupShim {
+    pub fn load(workspace_dir: impl Into<PathBuf>, socket: impl Into<PathBuf>) -> Result<Self> {
+        Ok(Self {
+            workspace_dir: workspace_dir.into(),
+            socket: socket.into(),
+            processes: Arc::new(Mutex::new(BTreeMap::new())),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+        })
+    }
+
+    pub async fn serve(self, ready_fd: Option<i32>, lifecycle_fd: Option<i32>) -> Result<()> {
+        if let Some(parent) = self.socket.parent() {
+            fs::create_dir_all(parent)?;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+        }
+        let _ = fs::remove_file(&self.socket);
+        let listener = UnixListener::bind(&self.socket)?;
+        fs::set_permissions(&self.socket, fs::Permissions::from_mode(0o600))?;
+        if let Some(fd) = lifecycle_fd {
+            unsafe {
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+            let group = self.clone();
+            std::thread::spawn(move || {
+                let mut byte = [0u8; 1];
+                let _ = unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) };
+                unsafe {
+                    libc::close(fd);
+                }
+                group.terminate_all();
+                group.shutdown.notify_waiters();
+            });
+        }
+        if let Some(fd) = ready_fd {
+            write_ready(fd);
+        }
+        let idle_group = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let processes = idle_group.processes.lock().unwrap();
+                if !processes.is_empty()
+                    && processes
+                        .values()
+                        .all(|s| s.inner.lock().unwrap().process.state.terminal())
+                {
+                    drop(processes);
+                    idle_group.shutdown.notify_waiters();
+                    break;
+                }
+            }
+        });
+        let app = Router::new()
+            .route("/v1/processes", post(group_start))
+            .route("/v1/processes/{id}/status", get(group_status))
+            .route("/v1/processes/{id}/signal", post(group_signal))
+            .route("/v1/processes/{id}/stop", post(group_stop))
+            .route("/v1/processes/{id}/logs", get(group_logs))
+            .route("/v1/processes/{id}/attach", any(group_attach))
+            .route("/v1/shutdown", post(group_shutdown))
+            .with_state(self.clone());
+        let stopping = self.shutdown.clone();
+        let server = axum::serve(listener, app).into_future();
+        tokio::pin!(server);
+        let result = tokio::select! {
+            value = &mut server => value,
+            _ = stopping.notified() => Ok(()),
+        };
+        let _ = fs::remove_file(&self.socket);
+        result?;
+        Ok(())
+    }
+
+    fn get(&self, id: &str) -> Option<Shim> {
+        self.processes.lock().unwrap().get(id).cloned()
+    }
+
+    fn terminate_all(&self) {
+        let shims = self
+            .processes
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for shim in &shims {
+            let pgid = shim.inner.lock().unwrap().process.process_group_id;
+            if pgid > 0 && !shim.inner.lock().unwrap().process.state.terminal() {
+                let _ = killpg(Pid::from_raw(pgid), Signal::SIGTERM);
+            }
+        }
+        std::thread::sleep(Duration::from_secs(10));
+        for shim in shims {
+            let inner = shim.inner.lock().unwrap();
+            if inner.process.process_group_id > 0 && !inner.process.state.terminal() {
+                let _ = killpg(
+                    Pid::from_raw(inner.process.process_group_id),
+                    Signal::SIGKILL,
+                );
+            }
+        }
+    }
+}
+
+async fn group_start(
+    State(group): State<GroupShim>,
+    Json(request): Json<StartProcessRequest>,
+) -> Response {
+    if !request.process_dir.starts_with(&group.workspace_dir) {
+        return (StatusCode::BAD_REQUEST, "invalid process directory").into_response();
+    }
+    let shim = match Shim::load(&request.process_dir, group.socket.with_extension("unused")) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+    let id = shim.inner.lock().unwrap().process.id.clone();
+    {
+        let mut processes = group.processes.lock().unwrap();
+        if let Some(existing) = processes.get(&id)
+            && !existing.inner.lock().unwrap().process.state.terminal()
+        {
+            return Json(json!({"ok":true})).into_response();
+        }
+        processes.remove(&id);
+    }
+    if let Err(error) = shim.start_process() {
+        shim.fail_wait(&error);
+        return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+    }
+    group.processes.lock().unwrap().insert(id, shim);
+    Json(json!({"ok":true})).into_response()
+}
+
+async fn group_status(State(group): State<GroupShim>, AxumPath(id): AxumPath<String>) -> Response {
+    match group.get(&id) {
+        Some(shim) => status(State(shim)).await.into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+async fn group_signal(
+    State(group): State<GroupShim>,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<SignalRequest>,
+) -> Response {
+    match group.get(&id) {
+        Some(shim) => signal(State(shim), Json(req)).await,
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+async fn group_stop(
+    State(group): State<GroupShim>,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<StopRequest>,
+) -> Response {
+    match group.get(&id) {
+        Some(shim) => stop(State(shim), Json(req)).await,
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+async fn group_logs(
+    State(group): State<GroupShim>,
+    AxumPath(id): AxumPath<String>,
+    query: Query<LogsQuery>,
+) -> Response {
+    match group.get(&id) {
+        Some(shim) => logs(State(shim), query).await,
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+async fn group_attach(
+    State(group): State<GroupShim>,
+    AxumPath(id): AxumPath<String>,
+    query: Query<AttachQuery>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    match group.get(&id) {
+        Some(shim) => attach(State(shim), query, ws).await,
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+async fn group_shutdown(State(group): State<GroupShim>) -> Response {
+    if group
+        .processes
+        .lock()
+        .unwrap()
+        .values()
+        .any(|s| !s.inner.lock().unwrap().process.state.terminal())
+    {
+        return (StatusCode::CONFLICT, "group still has running processes").into_response();
+    }
+    group.shutdown.notify_waiters();
+    Json(json!({"ok":true})).into_response()
 }
 
 impl Shim {
