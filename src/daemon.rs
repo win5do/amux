@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashSet, VecDeque},
     fs::{self, OpenOptions},
     future::IntoFuture,
     os::{
@@ -61,6 +61,7 @@ pub struct Daemon {
     event_tx: broadcast::Sender<ProcessEvent>,
     shutdown: Arc<Notify>,
     group_lifelines: Arc<Mutex<BTreeMap<String, fs::File>>>,
+    group_event_bridges: Arc<Mutex<HashSet<String>>>,
     last_request: Arc<AtomicU64>,
 }
 
@@ -104,6 +105,7 @@ impl Daemon {
             event_tx,
             shutdown: Arc::new(Notify::new()),
             group_lifelines: Arc::new(Mutex::new(BTreeMap::new())),
+            group_event_bridges: Arc::new(Mutex::new(HashSet::new())),
             last_request: Arc::new(AtomicU64::new(now_seconds())),
         })
     }
@@ -127,6 +129,7 @@ impl Daemon {
             event_tx,
             shutdown: Arc::new(Notify::new()),
             group_lifelines: Arc::new(Mutex::new(BTreeMap::new())),
+            group_event_bridges: Arc::new(Mutex::new(HashSet::new())),
             last_request: Arc::new(AtomicU64::new(now_seconds())),
         })
     }
@@ -181,7 +184,7 @@ impl Daemon {
 
         self.write_registration()?;
         let monitor = self.clone();
-        tokio::spawn(async move { monitor.monitor_processes().await });
+        tokio::spawn(async move { monitor.consistency_loop().await });
         let idle = self.clone();
         tokio::spawn(async move { idle.monitor_idle().await });
         let app = Router::new()
@@ -300,8 +303,9 @@ impl Daemon {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             } else {
+                let launch_socket = socket.clone();
                 let (group_id, lifeline) = tokio::task::spawn_blocking(move || {
-                    launch_detached(&path, &args, &workspace_dir, &socket)
+                    launch_detached(&path, &args, &workspace_dir, &launch_socket)
                 })
                 .await??;
                 self.group_lifelines
@@ -310,6 +314,7 @@ impl Daemon {
                     .insert(group_id, lifeline);
             }
         }
+        self.ensure_group_event_bridge(process.group_id.clone(), socket.clone());
         unix_http::json_request::<serde_json::Value>(
             &self.shim_socket(process),
             Method::POST,
@@ -334,6 +339,78 @@ impl Daemon {
         }
         *process = self.shim_status(process).await?;
         Ok(())
+    }
+
+    fn ensure_group_event_bridge(&self, group_id: String, socket: PathBuf) {
+        if !self
+            .group_event_bridges
+            .lock()
+            .unwrap()
+            .insert(group_id.clone())
+        {
+            return;
+        }
+        let daemon = self.clone();
+        tokio::spawn(async move {
+            let mut retry_delay = Duration::from_millis(250);
+            loop {
+                let request = Request::builder()
+                    .method(Method::GET)
+                    .uri("http://unix/v1/events")
+                    .body(Full::new(Bytes::new()));
+                if let Ok(request) = request
+                    && let Ok(response) = unix_http::request_stream(&socket, request).await
+                    && response.status().is_success()
+                {
+                    retry_delay = Duration::from_millis(250);
+                    let mut body = response.into_body();
+                    let mut pending = Vec::new();
+                    while let Some(frame) = body.frame().await {
+                        let Ok(frame) = frame else { break };
+                        pending.extend_from_slice(&frame.into_data().unwrap_or_default());
+                        while let Some(index) = pending.iter().position(|value| *value == b'\n') {
+                            let line = pending.drain(..=index).collect::<Vec<_>>();
+                            if let Ok(process) = serde_json::from_slice::<Process>(&line) {
+                                daemon.observe_process(process);
+                            }
+                        }
+                    }
+                }
+                if !socket.exists() {
+                    break;
+                }
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = (retry_delay * 2).min(Duration::from_secs(10));
+            }
+            daemon.group_event_bridges.lock().unwrap().remove(&group_id);
+        });
+    }
+
+    fn observe_process(&self, process: Process) {
+        let fingerprint = serde_json::to_string(&process).unwrap_or_default();
+        let kind = {
+            let mut hub = self.events.lock().unwrap();
+            if hub.fingerprints.get(&process.id) == Some(&fingerprint) {
+                return;
+            }
+            let kind = if hub.fingerprints.contains_key(&process.id) {
+                if process.state == ProcessState::Exited {
+                    ProcessEventKind::ProcessExited
+                } else if process.state == ProcessState::Failed {
+                    ProcessEventKind::ProcessUpdated
+                } else if process.state == ProcessState::Running {
+                    ProcessEventKind::ProcessStarted
+                } else {
+                    ProcessEventKind::ProcessUpdated
+                }
+            } else {
+                ProcessEventKind::ProcessCreated
+            };
+            hub.fingerprints.insert(process.id.clone(), fingerprint);
+            kind
+        };
+        let _ = self.store.save_process(&process);
+        self.emit(kind, process);
     }
 
     fn view(&self, process: Process) -> ProcessView {
@@ -424,31 +501,14 @@ impl Daemon {
         let _ = crate::store::atomic_json(&path, &value);
     }
 
-    async fn monitor_processes(&self) {
+    async fn consistency_loop(&self) {
         loop {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
             if !self.config.socket.exists() {
                 continue;
             }
-            for mut process in self.store.list_processes(None).unwrap_or_default() {
-                if !process.state.terminal()
-                    && let Ok(current) = self.shim_status(&process).await
-                {
-                    process = current;
-                }
-                let fingerprint = serde_json::to_string(&process).unwrap_or_default();
-                let changed =
-                    self.events.lock().unwrap().fingerprints.get(&process.id) != Some(&fingerprint);
-                if changed {
-                    let kind = if process.state.terminal() {
-                        ProcessEventKind::ProcessExited
-                    } else if process.state == ProcessState::Running {
-                        ProcessEventKind::ProcessStarted
-                    } else {
-                        ProcessEventKind::ProcessUpdated
-                    };
-                    self.emit(kind, process);
-                }
+            for process in self.store.list_processes(None).unwrap_or_default() {
+                self.observe_process(process);
             }
         }
     }
@@ -770,7 +830,6 @@ async fn run_process(
             error,
         );
     }
-    daemon.emit(ProcessEventKind::ProcessStarted, process.clone());
     let mut response = Response::ok();
     response.process = Some(daemon.view(process));
     (StatusCode::CREATED, Json(response)).into_response()
@@ -1137,7 +1196,6 @@ async fn restart_process(daemon: Daemon, mut process: Process) -> AxumResponse {
             error,
         );
     }
-    daemon.emit(ProcessEventKind::ProcessStarted, process.clone());
     let mut response = Response::ok();
     response.process = Some(daemon.view(process));
     Json(response).into_response()

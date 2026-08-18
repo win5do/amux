@@ -349,6 +349,7 @@ async fn group_reuse_parent_links_and_process_events() {
     );
     let child: serde_json::Value =
         serde_json::from_str(&ok(&state, &socket, &["--json", "inspect", "dev/child"])).unwrap();
+    let child_id = child["process"]["id"].as_str().unwrap().to_owned();
     assert_eq!(child["process"]["parent_process_id"], parent_id);
     assert_eq!(child["process"]["group_id"], parent["process"]["group_id"]);
     assert!(child["process"]["runtime_handle"].is_null());
@@ -388,6 +389,31 @@ async fn group_reuse_parent_links_and_process_events() {
     assert!(still_running.contains("\"state\":\"running\""));
     ok(&state, &socket, &["stop", "--time", "100ms", "dev/child"]);
     ok(&state, &socket, &["wait", "dev/child"]);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while ![&parent_id, &child_id].iter().all(|id| {
+        observed.iter().any(|event| {
+            &event.process_id == *id
+                && matches!(event.kind, amux::model::ProcessEventKind::ProcessExited)
+        })
+    }) && tokio::time::Instant::now() < deadline
+    {
+        let Ok(Some(frame)) = tokio::time::timeout_at(deadline, events.frame()).await else {
+            break;
+        };
+        pending.extend_from_slice(&frame.unwrap().into_data().unwrap_or_default());
+        while let Some(index) = pending.iter().position(|value| *value == b'\n') {
+            let line = pending.drain(..=index).collect::<Vec<_>>();
+            if let Ok(event) = serde_json::from_slice::<amux::model::ProcessEvent>(&line) {
+                observed.push(event);
+            }
+        }
+    }
+    assert!([&parent_id, &child_id].iter().all(|id| {
+        observed.iter().any(|event| {
+            &event.process_id == *id
+                && matches!(event.kind, amux::model::ProcessEventKind::ProcessExited)
+        })
+    }));
     daemon_process.kill().unwrap();
     let _ = daemon_process.wait();
 }

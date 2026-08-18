@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, VecDeque},
+    convert::Infallible,
     fs::{self, File},
     future::IntoFuture,
     io::{BufRead, BufReader, Read, Write},
@@ -23,6 +24,7 @@ use axum::{
     routing::{any, get, post},
 };
 use base64::Engine;
+use bytes::Bytes;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use nix::{
@@ -66,6 +68,7 @@ pub struct Shim {
     socket: PathBuf,
     inner: Arc<Mutex<Inner>>,
     output: broadcast::Sender<WireMessage>,
+    lifecycle: broadcast::Sender<Process>,
     readers: Arc<(Mutex<usize>, Condvar)>,
     shutdown: Arc<tokio::sync::Notify>,
 }
@@ -75,6 +78,7 @@ pub struct GroupShim {
     workspace_dir: PathBuf,
     socket: PathBuf,
     processes: Arc<Mutex<BTreeMap<String, Shim>>>,
+    lifecycle: broadcast::Sender<Process>,
     shutdown: Arc<tokio::sync::Notify>,
 }
 
@@ -85,10 +89,12 @@ struct StartProcessRequest {
 
 impl GroupShim {
     pub fn load(workspace_dir: impl Into<PathBuf>, socket: impl Into<PathBuf>) -> Result<Self> {
+        let (lifecycle, _) = broadcast::channel(256);
         Ok(Self {
             workspace_dir: workspace_dir.into(),
             socket: socket.into(),
             processes: Arc::new(Mutex::new(BTreeMap::new())),
+            lifecycle,
             shutdown: Arc::new(tokio::sync::Notify::new()),
         })
     }
@@ -120,9 +126,9 @@ impl GroupShim {
             write_ready(fd);
         }
         let idle_group = self.clone();
+        let mut lifecycle = self.lifecycle.subscribe();
         tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_millis(50)).await;
+            while lifecycle.recv().await.is_ok() {
                 let processes = idle_group.processes.lock().unwrap();
                 if !processes.is_empty()
                     && processes
@@ -137,6 +143,7 @@ impl GroupShim {
         });
         let app = Router::new()
             .route("/v1/processes", post(group_start))
+            .route("/v1/events", get(group_events))
             .route("/v1/processes/{id}/status", get(group_status))
             .route("/v1/processes/{id}/signal", post(group_signal))
             .route("/v1/processes/{id}/stop", post(group_stop))
@@ -194,7 +201,11 @@ async fn group_start(
     if !request.process_dir.starts_with(&group.workspace_dir) {
         return (StatusCode::BAD_REQUEST, "invalid process directory").into_response();
     }
-    let shim = match Shim::load(&request.process_dir, group.socket.with_extension("unused")) {
+    let shim = match Shim::load(
+        &request.process_dir,
+        group.socket.with_extension("unused"),
+        group.lifecycle.clone(),
+    ) {
         Ok(v) => v,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
@@ -208,12 +219,44 @@ async fn group_start(
         }
         processes.remove(&id);
     }
+    group
+        .processes
+        .lock()
+        .unwrap()
+        .insert(id.clone(), shim.clone());
     if let Err(error) = shim.start_process() {
         shim.fail_wait(&error);
         return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
     }
-    group.processes.lock().unwrap().insert(id, shim);
     Json(json!({"ok":true})).into_response()
+}
+
+async fn group_events(State(group): State<GroupShim>) -> Response {
+    let receiver = group.lifecycle.subscribe();
+    let initial = group
+        .processes
+        .lock()
+        .unwrap()
+        .values()
+        .filter_map(|shim| {
+            let process = shim.inner.lock().unwrap().process.clone();
+            serde_json::to_vec(&process).ok().map(|mut line| {
+                line.push(b'\n');
+                Ok::<_, Infallible>(Bytes::from(line))
+            })
+        })
+        .collect::<Vec<_>>();
+    let follow = tokio_stream::StreamExt::filter_map(BroadcastStream::new(receiver), |item| {
+        let process = item.ok()?;
+        let mut line = serde_json::to_vec(&process).ok()?;
+        line.push(b'\n');
+        Some(Ok::<_, Infallible>(Bytes::from(line)))
+    });
+    Body::from_stream(tokio_stream::StreamExt::chain(
+        tokio_stream::iter(initial),
+        follow,
+    ))
+    .into_response()
 }
 
 async fn group_status(State(group): State<GroupShim>, AxumPath(id): AxumPath<String>) -> Response {
@@ -278,7 +321,11 @@ async fn group_shutdown(State(group): State<GroupShim>) -> Response {
 }
 
 impl Shim {
-    pub fn load(dir: impl Into<PathBuf>, socket: impl Into<PathBuf>) -> Result<Self> {
+    pub fn load(
+        dir: impl Into<PathBuf>,
+        socket: impl Into<PathBuf>,
+        lifecycle: broadcast::Sender<Process>,
+    ) -> Result<Self> {
         let dir = dir.into();
         let socket = socket.into();
         let process: Process = read_json(dir.join("metadata.json"))?;
@@ -326,9 +373,14 @@ impl Shim {
                 next_attach: 0,
             })),
             output,
+            lifecycle,
             readers: Arc::new((Mutex::new(0), Condvar::new())),
             shutdown: Arc::new(tokio::sync::Notify::new()),
         })
+    }
+
+    fn publish_lifecycle(&self, process: Process) {
+        let _ = self.lifecycle.send(process);
     }
 
     pub async fn serve(self, ready_fd: Option<i32>) -> Result<()> {
@@ -416,7 +468,7 @@ impl Shim {
         if let Some(stderr) = child.stderr.take() {
             self.spawn_reader("stderr", stderr);
         }
-        {
+        let running = {
             let mut inner = self.inner.lock().unwrap();
             inner.input = stdin;
             inner.process.pid = pid;
@@ -424,7 +476,9 @@ impl Shim {
             inner.process.state = ProcessState::Running;
             inner.process.started_at = Some(Utc::now());
             atomic_json(&self.dir.join("metadata.json"), &inner.process)?;
-        }
+            inner.process.clone()
+        };
+        self.publish_lifecycle(running);
         self.spawn_wait_pipe(child);
         Ok(())
     }
@@ -448,7 +502,7 @@ impl Shim {
         let pid = child.process_id().unwrap_or(0) as i32;
         let reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
-        {
+        let running = {
             let mut inner = self.inner.lock().unwrap();
             inner.input = Some(writer);
             inner.pty = Some(pair.master);
@@ -457,7 +511,9 @@ impl Shim {
             inner.process.state = ProcessState::Running;
             inner.process.started_at = Some(Utc::now());
             atomic_json(&self.dir.join("metadata.json"), &inner.process)?;
-        }
+            inner.process.clone()
+        };
+        self.publish_lifecycle(running);
         self.spawn_reader("tty", reader);
         self.spawn_wait_pty(child);
         Ok(())
@@ -538,24 +594,31 @@ impl Shim {
             count = ready.wait(count).unwrap();
         }
         drop(count);
-        let mut inner = self.inner.lock().unwrap();
-        inner.process.exit_code = Some(code.unwrap_or(-1));
-        inner.process.exit_signal = signal.and_then(signal_name).unwrap_or_default();
-        inner.process.state = ProcessState::Exited;
-        inner.process.finished_at = Some(Utc::now());
-        inner.input = None;
-        let _ = atomic_json(&self.dir.join("metadata.json"), &inner.process);
-        let message = serde_json::to_string(&json!({"type":"exit","exit_code":inner.process.exit_code,"signal":inner.process.exit_signal})).unwrap_or_default();
-        drop(inner);
+        let (process, message) = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.process.exit_code = Some(code.unwrap_or(-1));
+            inner.process.exit_signal = signal.and_then(signal_name).unwrap_or_default();
+            inner.process.state = ProcessState::Exited;
+            inner.process.finished_at = Some(Utc::now());
+            inner.input = None;
+            let _ = atomic_json(&self.dir.join("metadata.json"), &inner.process);
+            let message = serde_json::to_string(&json!({"type":"exit","exit_code":inner.process.exit_code,"signal":inner.process.exit_signal})).unwrap_or_default();
+            (inner.process.clone(), message)
+        };
+        self.publish_lifecycle(process);
         let _ = self.output.send(WireMessage::Text(message));
     }
 
     fn fail_wait(&self, error: impl std::fmt::Display) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.process.state = ProcessState::Failed;
-        inner.process.error = error.to_string();
-        inner.process.finished_at = Some(Utc::now());
-        let _ = atomic_json(&self.dir.join("metadata.json"), &inner.process);
+        let process = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.process.state = ProcessState::Failed;
+            inner.process.error = error.to_string();
+            inner.process.finished_at = Some(Utc::now());
+            let _ = atomic_json(&self.dir.join("metadata.json"), &inner.process);
+            inner.process.clone()
+        };
+        self.publish_lifecycle(process);
     }
 }
 
@@ -574,15 +637,16 @@ async fn signal(State(shim): State<Shim>, Json(request): Json<SignalRequest>) ->
 }
 
 async fn stop(State(shim): State<Shim>, Json(request): Json<StopRequest>) -> Response {
-    let pgid = {
+    let (pgid, process) = {
         let mut inner = shim.inner.lock().unwrap();
         if inner.process.state.terminal() {
             return Json(json!({"ok":true})).into_response();
         }
         inner.process.state = ProcessState::Stopping;
         let _ = atomic_json(&shim.dir.join("metadata.json"), &inner.process);
-        inner.process.process_group_id
+        (inner.process.process_group_id, inner.process.clone())
     };
+    shim.publish_lifecycle(process);
     let _ = killpg(Pid::from_raw(pgid), Signal::SIGTERM);
     let delayed = shim.clone();
     tokio::spawn(async move {
@@ -738,8 +802,18 @@ async fn attach_socket(shim: Shim, socket: WebSocket, id: u64, query: AttachQuer
             },
             message = futures_util::StreamExt::next(&mut source) => match message {
                 Some(Ok(Message::Binary(data))) if !query.readonly => {
-                    let mut inner = shim.inner.lock().unwrap();
-                    if inner.controller == Some(id) && let Some(input) = inner.input.as_mut() { let _ = input.write_all(&data); let _ = input.flush(); }
+                    let failed = {
+                        let mut inner = shim.inner.lock().unwrap();
+                        inner.controller == Some(id)
+                            && inner.input.as_mut().is_some_and(|input| {
+                                input.write_all(&data).and_then(|_| input.flush()).is_err()
+                            })
+                    };
+                    if failed {
+                        let message = serde_json::to_string(&json!({"type":"input_error","code":"pty_write_failed"})).unwrap_or_default();
+                        let _ = sink.send(Message::Text(message.into())).await;
+                        break;
+                    }
                 }
                 Some(Ok(Message::Text(text))) if !query.readonly => handle_control(&shim, id, &text),
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
