@@ -2,11 +2,12 @@
 
 `amux` speaks HTTP/1.1 over a private Unix socket to `amuxd`. The daemon owns
 metadata and routing, but never owns the only process I/O descriptor. Every
-process has a detached `amux-shim` that owns its process group, pipes or PTY,
-log sequence, wait status, and attach controller.
+workspace has a detached group shim. The group shim hosts active per-process
+supervisors, each of which owns its process group, pipes or PTY, log sequence,
+wait status, and attach controller.
 
 ```text
-amux -> amuxd -> per-process amux-shim -> OS process group
+amux -> amuxd -> workspace group shim -> per-process supervisor -> OS process group
 ```
 
 The state tree uses the schema-v1 JSON layout from the original Go
@@ -15,13 +16,36 @@ paths live below `/tmp/amux-UID/shims` to fit macOS `sockaddr_un` limits.
 
 Each output stream has one authoritative reader. The shim appends bytes to the
 raw stream log, syncs it, appends a monotonically sequenced event to
-`events.jsonl`, then broadcasts it. A TTY has one writable controller and any
-number of readonly observers. `--takeover` replaces the controller.
+`events.jsonl`, then broadcasts it. Raw streams and their event index are
+rotated together as a generation under `output/`: `current/` is active and UTC
+timestamped `*.bak/` directories are retained history. Sequence numbers remain
+monotonic across generations and process restarts. Legacy process-root log
+files remain readable and are migrated when a shim next starts without a schema
+reset. A TTY has one writable controller and any number of readonly observers.
+`--takeover` replaces the controller.
+
+Historical log reads walk generations from oldest to newest directly from
+disk. A shim retains only the latest 4096 output event descriptors for live
+coordination; a lagging follower catches up from disk and receives a `gap`
+record only if rotation has already discarded the requested sequence. TTY
+replay remains capped at 4 MiB. Terminal supervisors are unloaded from the
+group shim after metadata and lifecycle state have been persisted, so later
+inspect, wait, and log requests use the durable store.
+
+The daemon and group shim redirect their own stdout and stderr through an
+in-process rotating writer. Their active `amuxd.log` and `shim.log` files use
+the same configurable size/count policy as process output and retain
+timestamped file backups.
 
 Restarted daemons discover processes from disk and reconnect to their shim
 sockets. A live-looking record whose shim cannot be reached becomes `unknown`.
 An unknown process from the current boot is not restarted automatically,
 because its unmanaged process tree may still exist.
+
+Named-daemon state removal uses the same persistent flock as daemon startup.
+The lock file lives outside the daemon state directory and is intentionally
+retained, allowing `daemon start` and destructive `daemon rm` to coordinate
+even when no state directory currently exists.
 
 ## Runtime model and direction
 

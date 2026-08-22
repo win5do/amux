@@ -20,6 +20,7 @@ path = "src/bin/amux.rs"
 
 [dependencies]
 anyhow = "1"
+async-stream = "0.3"
 axum = { version = "0.8", features = ["ws", "json"] }
 base64 = "0.22"
 bytes = "1"

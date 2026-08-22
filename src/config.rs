@@ -34,6 +34,19 @@ impl Config {
         let socket = runtime.join(format!("amux-{}-{digest}.sock", unsafe { libc::getuid() }));
         Ok(Self { state_dir, socket })
     }
+
+    pub fn lock_path(&self) -> Result<PathBuf> {
+        let parent = self
+            .state_dir
+            .parent()
+            .context("state directory has no parent")?;
+        let name = self
+            .state_dir
+            .file_name()
+            .context("state directory has no name")?
+            .to_string_lossy();
+        Ok(parent.join(format!(".{name}.lock")))
+    }
 }
 
 pub fn state_root() -> Result<PathBuf> {

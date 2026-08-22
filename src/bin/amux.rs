@@ -1,5 +1,10 @@
 use std::{
+    fs::{self, OpenOptions},
     io::{IsTerminal, Write},
+    os::{
+        fd::AsRawFd,
+        unix::fs::{FileTypeExt, OpenOptionsExt},
+    },
     path::PathBuf,
     time::Duration,
 };
@@ -112,6 +117,10 @@ enum DaemonCommand {
     },
     Stop {
         name: Option<String>,
+    },
+    /// Permanently remove all state for a stopped daemon.
+    Rm {
+        name: String,
     },
     #[command(hide = true)]
     Serve,
@@ -468,6 +477,13 @@ async fn run_daemon_command(
             let client = Client::named(Config::named(amux::config::state_root()?, name)?, name);
             if client.ready().await {
                 client.do_empty(Method::POST, "/v1/admin/stop").await?;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+                while client.config.socket.exists() && tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                if client.config.socket.exists() {
+                    anyhow::bail!("daemon {name} did not stop")
+                }
             }
             if json {
                 println!("{{\"ok\":true,\"name\":{}}}", serde_json::to_string(name)?);
@@ -476,6 +492,7 @@ async fn run_daemon_command(
             }
             Ok(())
         }
+        DaemonCommand::Rm { name } => remove_daemon(&name, json),
         DaemonCommand::List => {
             let root = amux::config::state_root()?.join("daemons");
             let mut records = Vec::new();
@@ -503,6 +520,58 @@ async fn run_daemon_command(
             Ok(())
         }
     }
+}
+
+fn remove_daemon(name: &str, json: bool) -> anyhow::Result<()> {
+    let config = Config::named(amux::config::state_root()?, name)?;
+    let lock_path = config.lock_path()?;
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(lock_path)?;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(amux::protocol::ApiError::new(
+            "daemon_running",
+            format!("daemon {name} is running"),
+        )
+        .into());
+    }
+    let removed = config.state_dir.exists();
+    let registered_socket =
+        amux::store::read_json::<serde_json::Value>(config.state_dir.join("daemon.json"))
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("socket")
+                    .and_then(|socket| socket.as_str())
+                    .map(PathBuf::from)
+            });
+    if removed {
+        fs::remove_dir_all(&config.state_dir)?;
+    }
+    for socket in registered_socket.into_iter().chain([config.socket.clone()]) {
+        if fs::symlink_metadata(&socket).is_ok_and(|metadata| metadata.file_type().is_socket()) {
+            fs::remove_file(socket)?;
+        }
+    }
+    if json {
+        println!(
+            "{{\"ok\":true,\"name\":{},\"removed\":{removed}}}",
+            serde_json::to_string(name)?
+        );
+    } else if removed {
+        println!("removed {name}");
+    } else {
+        println!("daemon {name} was already absent");
+    }
+    drop(lock);
+    Ok(())
 }
 
 async fn print_daemon_status(client: &Client, name: &str, json: bool) -> anyhow::Result<()> {
@@ -574,6 +643,14 @@ async fn stream_logs(mut body: hyper::body::Incoming, jsonl: bool) -> anyhow::Re
             let line = pending.drain(..=index).collect::<Vec<_>>();
             if jsonl {
                 std::io::stdout().write_all(&line)?;
+            } else if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&line)
+                && value.get("type").and_then(|value| value.as_str()) == Some("gap")
+            {
+                eprintln!(
+                    "log gap: requested after {}, oldest available {}",
+                    value["requested_after"].as_u64().unwrap_or(0),
+                    value["oldest_available"].as_u64().unwrap_or(0)
+                );
             } else if let Ok(event) = serde_json::from_slice::<OutputEvent>(&line)
                 && let Some(data) = event.data
             {

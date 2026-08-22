@@ -14,20 +14,33 @@ use tokio_tungstenite::tungstenite::Message;
 static E2E_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn daemon(state: &Path, socket: &Path) -> Child {
-    let child = Command::new(env!("CARGO_BIN_EXE_amux"))
+    daemon_with_env(state, socket, &[])
+}
+
+fn daemon_with_env(state: &Path, socket: &Path, env: &[(&str, &str)]) -> Child {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_amux"));
+    command
         .env("AMUX_STATE_DIR", state)
         .env("AMUX_SOCKET", socket)
+        .envs(env.iter().copied())
         .args(["daemon", "serve"])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::null());
+    let child = command.spawn().unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     while std::os::unix::net::UnixStream::connect(socket).is_err() {
         assert!(Instant::now() < deadline, "daemon socket was not ready");
         thread::sleep(Duration::from_millis(20));
     }
     child
+}
+
+fn named_amux(state: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_amux"))
+        .env("AMUX_STATE_DIR", state)
+        .args(args)
+        .output()
+        .unwrap()
 }
 
 fn amux(state: &Path, socket: &Path, args: &[&str]) -> Output {
@@ -111,6 +124,8 @@ async fn pipe_lifecycle_and_daemon_recovery() {
             .join(workspace_id)
             .join("processes")
             .join(process_id)
+            .join("output")
+            .join("current")
             .join("events.jsonl"),
     )
     .unwrap();
@@ -416,4 +431,170 @@ async fn group_reuse_parent_links_and_process_events() {
     }));
     daemon_process.kill().unwrap();
     let _ = daemon_process.wait();
+}
+
+#[tokio::test]
+async fn daemon_remove_is_locked_idempotent_and_isolated() {
+    let _guard = E2E_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+
+    for name in ["alpha", "beta"] {
+        let output = named_amux(&state, &["--json", "daemon", "start", name]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let alpha = Config::named(&state, "alpha").unwrap();
+    let beta = Config::named(&state, "beta").unwrap();
+    assert!(alpha.state_dir.exists() && beta.state_dir.exists());
+
+    let running = named_amux(&state, &["--json", "daemon", "rm", "alpha"]);
+    assert!(!running.status.success());
+    assert!(String::from_utf8_lossy(&running.stdout).contains("daemon_running"));
+
+    assert!(
+        named_amux(&state, &["daemon", "stop", "alpha"])
+            .status
+            .success()
+    );
+    let removed = named_amux(&state, &["--json", "daemon", "rm", "alpha"]);
+    assert!(removed.status.success());
+    assert!(String::from_utf8_lossy(&removed.stdout).contains("\"removed\":true"));
+    assert!(!alpha.state_dir.exists());
+    assert!(!alpha.socket.exists());
+    assert!(beta.state_dir.exists());
+    assert!(
+        named_amux(&state, &["daemon", "status", "beta"])
+            .status
+            .success()
+    );
+
+    let repeated = named_amux(&state, &["--json", "daemon", "rm", "alpha"]);
+    assert!(repeated.status.success());
+    assert!(String::from_utf8_lossy(&repeated.stdout).contains("\"removed\":false"));
+
+    assert!(
+        named_amux(&state, &["daemon", "stop", "beta"])
+            .status
+            .success()
+    );
+    assert!(
+        named_amux(&state, &["daemon", "rm", "beta"])
+            .status
+            .success()
+    );
+}
+
+#[tokio::test]
+async fn output_rotation_preserves_generations_and_reports_gap() {
+    let _guard = E2E_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let socket = temp.path().join("amux.sock");
+    let mut daemon_process = daemon_with_env(
+        &state,
+        &socket,
+        &[
+            ("AMUX_LOG_ROTATE_SIZE", "512"),
+            ("AMUX_LOG_BACKUP_COUNT", "2"),
+        ],
+    );
+    ok(&state, &socket, &["workspace", "create", "dev"]);
+    ok(
+        &state,
+        &socket,
+        &[
+            "run",
+            "--workspace",
+            "dev",
+            "--name",
+            "rotating",
+            "--",
+            "/bin/sh",
+            "-c",
+            "i=0; while [ $i -lt 30 ]; do printf 'abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789'; sleep 0.02; i=$((i+1)); done; printf '\\377'",
+        ],
+    );
+    let waited = ok(&state, &socket, &["--json", "wait", "dev/rotating"]);
+    let value: serde_json::Value = serde_json::from_str(&waited).unwrap();
+    let process_dir = state
+        .join("workspaces")
+        .join(value["process"]["workspace_id"].as_str().unwrap())
+        .join("processes")
+        .join(value["process"]["id"].as_str().unwrap());
+    let output_dir = process_dir.join("output");
+    let mut generations = std::fs::read_dir(&output_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    generations.sort();
+    assert_eq!(
+        generations
+            .iter()
+            .filter(|path| path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with(".bak"))
+            .count(),
+        2
+    );
+    let mut sequences = Vec::new();
+    for generation in &generations {
+        let index = std::fs::read_to_string(generation.join("events.jsonl")).unwrap();
+        assert!(generation.join("stdout.log").exists());
+        for line in index.lines() {
+            let event: amux::model::OutputEvent = serde_json::from_str(line).unwrap();
+            sequences.push(event.sequence);
+        }
+    }
+    sequences.sort_unstable();
+    assert!(sequences.windows(2).all(|pair| pair[1] == pair[0] + 1));
+    assert!(sequences[0] > 1, "old generations should have been pruned");
+
+    let json_logs = amux(&state, &socket, &["logs", "dev/rotating", "--jsonl"]);
+    assert!(json_logs.status.success());
+    let stdout = String::from_utf8_lossy(&json_logs.stdout);
+    assert!(stdout.lines().next().unwrap().contains("\"type\":\"gap\""));
+    assert!(stdout.contains("\"encoding\":\"base64\""));
+    let plain_logs = amux(&state, &socket, &["logs", "dev/rotating"]);
+    assert!(plain_logs.status.success());
+    assert!(String::from_utf8_lossy(&plain_logs.stderr).contains("log gap"));
+
+    daemon_process.kill().unwrap();
+    let _ = daemon_process.wait();
+}
+
+#[test]
+fn invalid_log_configuration_rejects_daemon_and_shim_startup() {
+    let temp = tempfile::tempdir().unwrap();
+    let daemon_output = Command::new(env!("CARGO_BIN_EXE_amux"))
+        .env("AMUX_STATE_DIR", temp.path().join("daemon-state"))
+        .env("AMUX_SOCKET", temp.path().join("daemon.sock"))
+        .env("AMUX_LOG_ROTATE_SIZE", "0")
+        .args(["daemon", "serve"])
+        .output()
+        .unwrap();
+    assert!(!daemon_output.status.success());
+    assert!(String::from_utf8_lossy(&daemon_output.stderr).contains("AMUX_LOG_ROTATE_SIZE"));
+
+    let shim_output = Command::new(env!("CARGO_BIN_EXE_amux"))
+        .env("AMUX_LOG_BACKUP_COUNT", "17")
+        .args([
+            "daemon",
+            "shim",
+            "--workspace-dir",
+            temp.path().to_str().unwrap(),
+            "--socket",
+            temp.path().join("shim.sock").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!shim_output.status.success());
+    assert!(String::from_utf8_lossy(&shim_output.stderr).contains("AMUX_LOG_BACKUP_COUNT"));
 }

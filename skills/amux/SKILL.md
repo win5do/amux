@@ -68,6 +68,25 @@ amux rm "$AMUX_WORKSPACE/api"
 - Remove only exited processes whose retained metadata and logs are no longer needed.
 - Never stop, restart, kill, or remove the current process identified by `AMUX_PROCESS_ID`.
 
+To permanently delete every workspace, process record, and retained log owned
+by a named daemon, stop it first and then remove its state:
+
+```bash
+amux daemon stop dev
+amux daemon rm dev
+```
+
+`daemon rm` is destructive, operates directly on disk, and refuses a running
+daemon. Inspect the daemon and confirm ownership before using it. Repeating the
+command for already-absent state is safe.
+
+Process logs rotate by logical generation and `amux logs` transparently reads
+retained backups. A plain log stream reports discarded history on stderr; a
+JSONL stream emits a `type: "gap"` record. Long-running daemon and shim logs use
+the same defaults. Override them only when needed with
+`AMUX_LOG_ROTATE_SIZE` (default `64MiB`) and `AMUX_LOG_BACKUP_COUNT` (default
+`2`, allowed `0..16`).
+
 ## Attach to TTYs
 
 ```bash

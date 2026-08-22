@@ -46,6 +46,7 @@ amux daemon start work
 amux daemon status work
 amux --daemon work ps
 amux daemon stop work
+amux daemon rm work
 amux workspace ls
 amux ps --workspace dev
 amux inspect dev/api
@@ -67,7 +68,25 @@ Configuration:
 - `AMUX_DAEMON`: selected daemon name (default: `default`).
 - `AMUX_STATE_DIR`: persistent metadata and output logs.
 - `AMUX_SOCKET`: test/debug-only direct Unix socket override.
+- `AMUX_LOG_ROTATE_SIZE`: active logical log size before rotation (default
+  `64MiB`; accepts bytes, `KiB`, `MiB`, or `GiB`, and must be greater than
+  zero).
+- `AMUX_LOG_BACKUP_COUNT`: retained rotated generations (default `2`, range
+  `0..16`).
 - State directories are mode `0700`; sockets and state files are mode `0600`.
+
+`amux daemon rm <name>` permanently deletes all persistent state for a named
+daemon. It is accepted only after that daemon has stopped, is idempotent when
+the state is already absent, and does not lazily start or connect to a daemon.
+
+Process output is stored as one active `output/current/` generation plus UTC
+timestamped `output/<timestamp>.bak/` generations. Every generation contains
+its raw stream files and matching `events.jsonl`, so event offsets always refer
+to files in the same directory. `amux logs` reads retained generations oldest
+first. When `--after` points into discarded history, JSONL output includes a
+`gap` record and plain output reports the gap on stderr before continuing with
+the oldest retained output. `amuxd.log` and workspace `shim.log` use the same
+size and backup-count policy with `<name>.<timestamp>.bak` backups.
 
 The distributable Codex Skill lives at [`skills/amux`](skills/amux). Install or
 link that directory as `amux` in the active Codex skills home. Treefold-managed

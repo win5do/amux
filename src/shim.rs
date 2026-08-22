@@ -1,11 +1,11 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     convert::Infallible,
-    fs::{self, File},
+    fs,
     future::IntoFuture,
-    io::{BufRead, BufReader, Read, Write},
+    io::{Read, Write},
     os::unix::{fs::PermissionsExt, process::CommandExt},
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{Arc, Condvar, Mutex},
     time::Duration,
@@ -23,7 +23,6 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{any, get, post},
 };
-use base64::Engine;
 use bytes::Bytes;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
@@ -38,8 +37,10 @@ use tokio::{net::UnixListener, sync::broadcast};
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::{
-    model::{EncodedData, IoMode, OutputEvent, Process, ProcessState, SignalRequest, StopRequest},
-    store::{append_line, append_raw, atomic_json, read_json},
+    logging::{LogConfig, install_process_log},
+    model::{IoMode, Process, ProcessState, SignalRequest, StopRequest},
+    output::{OutputLog, OutputState, RecordReader},
+    store::{atomic_json, read_json},
 };
 
 const REPLAY_LIMIT: usize = 4 * 1024 * 1024;
@@ -48,9 +49,7 @@ struct Inner {
     process: Process,
     input: Option<Box<dyn Write + Send>>,
     pty: Option<Box<dyn MasterPty + Send>>,
-    sequence: u64,
-    offsets: BTreeMap<String, i64>,
-    events: Vec<OutputEvent>,
+    output: OutputState,
     replay: VecDeque<u8>,
     controller: Option<u64>,
     next_attach: u64,
@@ -66,6 +65,7 @@ enum WireMessage {
 pub struct Shim {
     dir: PathBuf,
     socket: PathBuf,
+    output_log: OutputLog,
     inner: Arc<Mutex<Inner>>,
     output: broadcast::Sender<WireMessage>,
     lifecycle: broadcast::Sender<Process>,
@@ -80,6 +80,7 @@ pub struct GroupShim {
     processes: Arc<Mutex<BTreeMap<String, Shim>>>,
     lifecycle: broadcast::Sender<Process>,
     shutdown: Arc<tokio::sync::Notify>,
+    log_config: LogConfig,
 }
 
 #[derive(serde::Deserialize)]
@@ -89,6 +90,7 @@ struct StartProcessRequest {
 
 impl GroupShim {
     pub fn load(workspace_dir: impl Into<PathBuf>, socket: impl Into<PathBuf>) -> Result<Self> {
+        let log_config = LogConfig::from_env()?;
         let (lifecycle, _) = broadcast::channel(256);
         Ok(Self {
             workspace_dir: workspace_dir.into(),
@@ -96,10 +98,14 @@ impl GroupShim {
             processes: Arc::new(Mutex::new(BTreeMap::new())),
             lifecycle,
             shutdown: Arc::new(tokio::sync::Notify::new()),
+            log_config,
         })
     }
 
     pub async fn serve(self, ready_fd: Option<i32>, lifecycle_fd: Option<i32>) -> Result<()> {
+        if lifecycle_fd.is_some() {
+            install_process_log(self.workspace_dir.join("shim.log"), self.log_config)?;
+        }
         if let Some(parent) = self.socket.parent() {
             fs::create_dir_all(parent)?;
             fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
@@ -128,16 +134,30 @@ impl GroupShim {
         let idle_group = self.clone();
         let mut lifecycle = self.lifecycle.subscribe();
         tokio::spawn(async move {
-            while lifecycle.recv().await.is_ok() {
-                let processes = idle_group.processes.lock().unwrap();
-                if !processes.is_empty()
-                    && processes
-                        .values()
-                        .all(|s| s.inner.lock().unwrap().process.state.terminal())
-                {
-                    drop(processes);
-                    idle_group.shutdown.notify_waiters();
-                    break;
+            loop {
+                match lifecycle.recv().await {
+                    Ok(process) => {
+                        if process.state.terminal() {
+                            let mut processes = idle_group.processes.lock().unwrap();
+                            processes.remove(&process.id);
+                            if processes.is_empty() {
+                                drop(processes);
+                                idle_group.shutdown.notify_waiters();
+                                break;
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let mut processes = idle_group.processes.lock().unwrap();
+                        processes
+                            .retain(|_, shim| !shim.inner.lock().unwrap().process.state.terminal());
+                        if processes.is_empty() {
+                            drop(processes);
+                            idle_group.shutdown.notify_waiters();
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
@@ -205,6 +225,7 @@ async fn group_start(
         &request.process_dir,
         group.socket.with_extension("unused"),
         group.lifecycle.clone(),
+        group.log_config,
     ) {
         Ok(v) => v,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
@@ -325,49 +346,23 @@ impl Shim {
         dir: impl Into<PathBuf>,
         socket: impl Into<PathBuf>,
         lifecycle: broadcast::Sender<Process>,
+        log_config: LogConfig,
     ) -> Result<Self> {
         let dir = dir.into();
         let socket = socket.into();
         let process: Process = read_json(dir.join("metadata.json"))?;
-        let mut sequence = 0;
-        let mut offsets = BTreeMap::new();
-        let mut events = vec![];
-        if let Ok(file) = File::open(dir.join("events.jsonl")) {
-            for line in BufReader::new(file).lines().map_while(Result::ok) {
-                if let Ok(event) = serde_json::from_str::<OutputEvent>(&line) {
-                    sequence = sequence.max(event.sequence);
-                    let end = event.offset + event.length as i64;
-                    offsets
-                        .entry(event.stream.clone())
-                        .and_modify(|v: &mut i64| *v = (*v).max(end))
-                        .or_insert(end);
-                    events.push(event);
-                }
-            }
-        }
-        let mut replay = VecDeque::new();
-        if let Ok(bytes) = fs::read(dir.join("tty.log")) {
-            replay.extend(
-                bytes
-                    .into_iter()
-                    .rev()
-                    .take(REPLAY_LIMIT)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev(),
-            );
-        }
+        let (output_log, output_state) = OutputLog::open(&dir, log_config)?;
+        let replay = output_log.replay_tail("tty", REPLAY_LIMIT)?;
         let (output, _) = broadcast::channel(256);
         Ok(Self {
             dir,
             socket,
+            output_log,
             inner: Arc::new(Mutex::new(Inner {
                 process,
                 input: None,
                 pty: None,
-                sequence,
-                offsets,
-                events,
+                output: output_state,
                 replay,
                 controller: None,
                 next_attach: 0,
@@ -538,28 +533,14 @@ impl Shim {
 
     fn emit(&self, stream: &str, bytes: &[u8]) {
         let mut inner = self.inner.lock().unwrap();
-        let raw_path = self.dir.join(format!("{stream}.log"));
-        let offset = *inner.offsets.get(stream).unwrap_or(&0);
-        if append_raw(&raw_path, bytes).is_err() {
+        let execution = inner.process.execution;
+        if self
+            .output_log
+            .append(&mut inner.output, stream, bytes, execution)
+            .is_err()
+        {
             return;
         }
-        inner.sequence += 1;
-        let event = OutputEvent {
-            sequence: inner.sequence,
-            execution: inner.process.execution,
-            timestamp: Utc::now(),
-            stream: stream.into(),
-            offset,
-            length: bytes.len(),
-            data: None,
-        };
-        if let Ok(line) = serde_json::to_vec(&event) {
-            let _ = append_line(&self.dir.join("events.jsonl"), &line);
-        }
-        inner
-            .offsets
-            .insert(stream.into(), offset + bytes.len() as i64);
-        inner.events.push(event);
         inner.replay.extend(bytes);
         while inner.replay.len() > REPLAY_LIMIT {
             inner.replay.pop_front();
@@ -619,6 +600,10 @@ impl Shim {
             inner.process.clone()
         };
         self.publish_lifecycle(process);
+        let _ = self.output.send(WireMessage::Text(
+            serde_json::to_string(&json!({"type":"exit","error":"process wait failed"}))
+                .unwrap_or_default(),
+        ));
     }
 }
 
@@ -672,52 +657,66 @@ struct LogsQuery {
 }
 
 async fn logs(State(shim): State<Shim>, Query(query): Query<LogsQuery>) -> Response {
-    let initial = {
-        let inner = shim.inner.lock().unwrap();
-        inner
-            .events
-            .iter()
-            .filter(|event| event.sequence > query.after)
-            .filter_map(|event| event_with_data(&shim.dir, event.clone()).ok())
-            .filter_map(|event| serde_json::to_vec(&event).ok())
-            .map(|mut line| {
-                line.push(b'\n');
-                Ok::<_, std::convert::Infallible>(bytes::Bytes::from(line))
-            })
-            .collect::<Vec<_>>()
-    };
     if !query.follow {
-        return Body::from_stream(tokio_stream::iter(initial)).into_response();
-    }
-    let follow_shim = shim.clone();
-    let mut cursor = query.after.max({
-        let inner = shim.inner.lock().unwrap();
-        inner.events.last().map_or(0, |event| event.sequence)
-    });
-    let stream = tokio_stream::StreamExt::filter_map(
-        BroadcastStream::new(shim.output.subscribe()),
-        move |message| {
-            if !matches!(message, Ok(WireMessage::Binary(_))) {
-                return None;
+        let boundary = shim.inner.lock().unwrap().output.sequence;
+        let dir = shim.dir.clone();
+        let stream = async_stream::stream! {
+            if let Ok(records) = RecordReader::open(&dir, query.after, Some(boundary)) {
+                for record in records.flatten() {
+                    if let Ok(line) = record.to_json_line() {
+                        yield Ok::<_, Infallible>(Bytes::from(line));
+                    }
+                }
             }
-            let inner = follow_shim.inner.lock().unwrap();
-            let event = inner
-                .events
-                .iter()
-                .find(|event| event.sequence > cursor)?
-                .clone();
-            cursor = event.sequence;
-            let event = event_with_data(&follow_shim.dir, event).ok()?;
-            let mut line = serde_json::to_vec(&event).ok()?;
-            line.push(b'\n');
-            Some(Ok::<_, std::convert::Infallible>(bytes::Bytes::from(line)))
-        },
-    );
-    Body::from_stream(tokio_stream::StreamExt::chain(
-        tokio_stream::iter(initial),
-        stream,
-    ))
-    .into_response()
+        };
+        return Body::from_stream(stream).into_response();
+    }
+    let mut receiver = shim.output.subscribe();
+    let boundary = shim.inner.lock().unwrap().output.sequence;
+    let stream = async_stream::stream! {
+        if let Ok(records) = RecordReader::open(&shim.dir, query.after, Some(boundary)) {
+            for record in records.flatten() {
+                if let Ok(line) = record.to_json_line() {
+                    yield Ok::<_, Infallible>(Bytes::from(line));
+                }
+            }
+        }
+        let mut cursor = boundary.max(query.after);
+        loop {
+            match receiver.recv().await {
+                Ok(WireMessage::Text(text)) => {
+                    if serde_json::from_str::<serde_json::Value>(&text)
+                        .ok()
+                        .and_then(|value| value.get("type").and_then(|kind| kind.as_str()).map(str::to_owned))
+                        .as_deref() == Some("exit")
+                    {
+                        let latest = shim.inner.lock().unwrap().output.sequence;
+                        if let Ok(records) = RecordReader::open(&shim.dir, cursor, Some(latest)) {
+                            for record in records.flatten() {
+                                if let Ok(line) = record.to_json_line() {
+                                    yield Ok::<_, Infallible>(Bytes::from(line));
+                                }
+                            }
+                        }
+                        break;
+                    }
+                },
+                Ok(WireMessage::Binary(_)) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                    let latest = shim.inner.lock().unwrap().output.sequence;
+                    if let Ok(records) = RecordReader::open(&shim.dir, cursor, Some(latest)) {
+                        for record in records.flatten() {
+                            if let Ok(line) = record.to_json_line() {
+                                yield Ok::<_, Infallible>(Bytes::from(line));
+                            }
+                        }
+                    }
+                    cursor = latest;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+    Body::from_stream(stream).into_response()
 }
 
 #[derive(Deserialize)]
@@ -861,27 +860,6 @@ fn release(shim: &Shim, id: u64) {
     if inner.controller == Some(id) {
         inner.controller = None;
     }
-}
-
-fn event_with_data(dir: &Path, mut event: OutputEvent) -> Result<OutputEvent> {
-    use std::io::{Read as _, Seek, SeekFrom};
-    let mut file = File::open(dir.join(format!("{}.log", event.stream)))?;
-    file.seek(SeekFrom::Start(event.offset as u64))?;
-    let mut bytes = vec![0u8; event.length];
-    file.read_exact(&mut bytes)?;
-    event.data = Some(match String::from_utf8(bytes.clone()) {
-        Ok(text) => EncodedData {
-            encoding: "utf8".into(),
-            text,
-            base64: String::new(),
-        },
-        Err(_) => EncodedData {
-            encoding: "base64".into(),
-            text: String::new(),
-            base64: base64::engine::general_purpose::STANDARD.encode(bytes),
-        },
-    });
-    Ok(event)
 }
 
 async fn shutdown(State(shim): State<Shim>) -> Response {

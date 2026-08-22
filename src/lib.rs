@@ -1,7 +1,9 @@
 pub mod client;
 pub mod config;
 pub mod daemon;
+pub mod logging;
 pub mod model;
+pub mod output;
 pub mod protocol;
 pub mod shim;
 pub mod store;

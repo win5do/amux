@@ -30,7 +30,6 @@ use axum::{
     response::{IntoResponse, Response as AxumResponse},
     routing::{any, get, post},
 };
-use base64::Engine;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::{BodyExt, Full};
@@ -43,7 +42,9 @@ use tokio_tungstenite::{client_async, tungstenite};
 
 use crate::{
     config::{Config, boot_id},
+    logging::{LogConfig, install_process_log},
     model::*,
+    output::RecordReader,
     protocol::Response,
     store::Store,
     unix_http,
@@ -63,6 +64,7 @@ pub struct Daemon {
     group_lifelines: Arc<Mutex<BTreeMap<String, fs::File>>>,
     group_event_bridges: Arc<Mutex<HashSet<String>>>,
     last_request: Arc<AtomicU64>,
+    log_config: LogConfig,
 }
 
 const EVENT_BUFFER_LIMIT: usize = 4096;
@@ -88,6 +90,7 @@ impl Daemon {
         shim_path: PathBuf,
         shim_args: Vec<String>,
     ) -> Result<Self> {
+        let log_config = LogConfig::from_env()?;
         let store = Arc::new(Store::deferred(&config.state_dir));
         let (event_tx, _) = broadcast::channel(EVENT_BUFFER_LIMIT);
         Ok(Self {
@@ -107,12 +110,14 @@ impl Daemon {
             group_lifelines: Arc::new(Mutex::new(BTreeMap::new())),
             group_event_bridges: Arc::new(Mutex::new(HashSet::new())),
             last_request: Arc::new(AtomicU64::new(now_seconds())),
+            log_config,
         })
     }
 
     /// Creates a daemon whose shims run as tasks in the daemon process.
     /// Intended for tests; embedded shims do not survive their host process.
     pub fn with_embedded_shims(config: Config) -> Result<Self> {
+        let log_config = LogConfig::from_env()?;
         let (event_tx, _) = broadcast::channel(EVENT_BUFFER_LIMIT);
         Ok(Self {
             store: Arc::new(Store::deferred(&config.state_dir)),
@@ -131,6 +136,7 @@ impl Daemon {
             group_lifelines: Arc::new(Mutex::new(BTreeMap::new())),
             group_event_bridges: Arc::new(Mutex::new(HashSet::new())),
             last_request: Arc::new(AtomicU64::new(now_seconds())),
+            log_config,
         })
     }
 
@@ -151,13 +157,7 @@ impl Daemon {
             .parent()
             .context("state directory has no parent")?;
         fs::create_dir_all(state_parent)?;
-        let state_name = self
-            .config
-            .state_dir
-            .file_name()
-            .context("state directory has no name")?
-            .to_string_lossy();
-        let lock_path = state_parent.join(format!(".{state_name}.lock"));
+        let lock_path = self.config.lock_path()?;
         let lock = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -175,6 +175,9 @@ impl Daemon {
             bail!("another amuxd owns the socket")
         }
         self.store.ensure_schema()?;
+        if !self.embedded_shims {
+            install_process_log(self.config.state_dir.join("amuxd.log"), self.log_config)?;
+        }
         let _ = fs::remove_file(&self.config.socket);
         let listener = UnixListener::bind(&self.config.socket)?;
         fs::set_permissions(&self.config.socket, fs::Permissions::from_mode(0o600))?;
@@ -383,6 +386,7 @@ impl Daemon {
                 retry_delay = (retry_delay * 2).min(Duration::from_secs(10));
             }
             daemon.group_event_bridges.lock().unwrap().remove(&group_id);
+            daemon.group_lifelines.lock().unwrap().remove(&group_id);
         });
     }
 
@@ -409,8 +413,12 @@ impl Daemon {
             hub.fingerprints.insert(process.id.clone(), fingerprint);
             kind
         };
+        let terminal = process.state.terminal();
         let _ = self.store.save_process(&process);
-        self.emit(kind, process);
+        self.emit(kind, process.clone());
+        if terminal {
+            self.events.lock().unwrap().fingerprints.remove(&process.id);
+        }
     }
 
     fn view(&self, process: Process) -> ProcessView {
@@ -456,7 +464,11 @@ impl Daemon {
         let event = {
             let mut hub = self.events.lock().unwrap();
             hub.sequence += 1;
-            hub.fingerprints.insert(process.id.clone(), fingerprint);
+            if kind == ProcessEventKind::ProcessRemoved || process.state.terminal() {
+                hub.fingerprints.remove(&process.id);
+            } else {
+                hub.fingerprints.insert(process.id.clone(), fingerprint);
+            }
             let event = ProcessEvent {
                 kind,
                 daemon_instance_id: self.instance_id.as_ref().clone(),
@@ -508,7 +520,9 @@ impl Daemon {
                 continue;
             }
             for process in self.store.list_processes(None).unwrap_or_default() {
-                self.observe_process(process);
+                if !process.state.terminal() {
+                    self.observe_process(process);
+                }
             }
         }
     }
@@ -887,8 +901,15 @@ async fn process_route(
         Err(e) => return api_error(StatusCode::NOT_FOUND, "process_not_found", e),
     };
     match action {
+        Some("attach") if process.state.terminal() => {
+            return api_error(
+                StatusCode::CONFLICT,
+                "invalid_state",
+                "terminal process cannot be attached",
+            );
+        }
         Some("attach") => return proxy_attach(daemon, process, request).await,
-        Some("logs") if process.state.terminal() && !daemon.shim_socket(&process).exists() => {
+        Some("logs") if process.state.terminal() => {
             return historical_logs(&daemon, &process, request.uri().query()).unwrap_or_else(|e| {
                 api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e)
             });
@@ -932,7 +953,6 @@ async fn process_route(
                     anyhow!("running process must be stopped before removal"),
                 );
             }
-            shutdown_shim(&daemon, &process).await;
             match daemon.store.remove_process(&process) {
                 Ok(()) => {
                     daemon.emit(ProcessEventKind::ProcessRemoved, process);
@@ -955,37 +975,15 @@ fn historical_logs(
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
     let dir = daemon.store.process_dir(&process.workspace_id, &process.id);
-    let mut output = Vec::new();
-    if let Ok(file) = fs::File::open(dir.join("events.jsonl")) {
-        use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
-        for line in BufReader::new(file).lines().map_while(std::io::Result::ok) {
-            let Ok(mut event) = serde_json::from_str::<OutputEvent>(&line) else {
-                continue;
-            };
-            if event.sequence <= after {
-                continue;
+    let records = RecordReader::open(&dir, after, None)?;
+    let stream = async_stream::stream! {
+        for record in records.flatten() {
+            if let Ok(line) = record.to_json_line() {
+                yield Ok::<_, std::convert::Infallible>(Bytes::from(line));
             }
-            let mut raw = fs::File::open(dir.join(format!("{}.log", event.stream)))?;
-            raw.seek(SeekFrom::Start(event.offset as u64))?;
-            let mut bytes = vec![0; event.length];
-            raw.read_exact(&mut bytes)?;
-            event.data = Some(match String::from_utf8(bytes.clone()) {
-                Ok(text) => EncodedData {
-                    encoding: "utf8".into(),
-                    text,
-                    base64: String::new(),
-                },
-                Err(_) => EncodedData {
-                    encoding: "base64".into(),
-                    text: String::new(),
-                    base64: base64::engine::general_purpose::STANDARD.encode(bytes),
-                },
-            });
-            serde_json::to_writer(&mut output, &event)?;
-            output.push(b'\n');
         }
-    }
-    Ok(Body::from(output).into_response())
+    };
+    Ok(Body::from_stream(stream).into_response())
 }
 
 async fn process_base_encoded(
@@ -1175,7 +1173,19 @@ async fn restart_process(daemon: Daemon, mut process: Process) -> AxumResponse {
             anyhow!("process cannot be safely restarted"),
         );
     }
-    shutdown_shim(&daemon, &process).await;
+    let group_has_other_active_processes = daemon
+        .store
+        .list_processes(None)
+        .unwrap_or_default()
+        .into_iter()
+        .any(|candidate| {
+            candidate.id != process.id
+                && candidate.group_id == process.group_id
+                && !candidate.state.terminal()
+        });
+    if !group_has_other_active_processes && daemon.shim_socket(&process).exists() {
+        shutdown_shim(&daemon, &process).await;
+    }
     process.state = ProcessState::Starting;
     process.execution += 1;
     process.pid = 0;
