@@ -31,10 +31,10 @@ The current implementation supports one execution combination only:
 - execution method: a host OS process group.
 
 The CLI and protocol currently identify this execution method with the runtime
-value `host`. Docker, Docker Compose, and remote SSH are not native runtimes
-today. They can still be launched as foreground host commands, but in that case
-amux owns the local CLI process rather than the detached container, Compose
-project, or remote process.
+value `host`. Container and remote SSH execution are not native runtimes today.
+They can still be launched through foreground host commands, but in that case
+amux owns the local CLI process rather than the detached container, container
+application, or remote process.
 
 Future runtime support should separate two independent concerns instead of
 adding each combination to one flat runtime enum:
@@ -42,7 +42,7 @@ adding each combination to one flat runtime enum:
 - **placement** describes where execution happens, such as `local` or a future
   remote SSH endpoint;
 - **executor** describes how the command is run at that placement, such as a
-  host process or a future Docker container.
+  host process or a future container.
 
 This produces composable combinations without introducing special runtime
 names for every pairing:
@@ -50,9 +50,9 @@ names for every pairing:
 | Placement | Executor | Support |
 | --- | --- | --- |
 | local | host process | supported |
-| local | Docker | future direction |
+| local | container | future direction |
 | remote SSH | host process | future direction |
-| remote SSH | Docker | future direction |
+| remote SSH | container | future direction |
 
 The entries marked as future direction illustrate the intended architecture;
 they are not current compatibility promises.
