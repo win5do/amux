@@ -23,3 +23,49 @@ sockets. A live-looking record whose shim cannot be reached becomes `unknown`.
 An unknown process from the current boot is not restarted automatically,
 because its unmanaged process tree may still exist.
 
+## Runtime model and direction
+
+The current implementation supports one execution combination only:
+
+- execution location: `local`;
+- execution method: a host OS process group.
+
+The CLI and protocol currently identify this execution method with the runtime
+value `host`. Docker, Docker Compose, and remote SSH are not native runtimes
+today. They can still be launched as foreground host commands, but in that case
+amux owns the local CLI process rather than the detached container, Compose
+project, or remote process.
+
+Future runtime support should separate two independent concerns instead of
+adding each combination to one flat runtime enum:
+
+- **placement** describes where execution happens, such as `local` or a future
+  remote SSH endpoint;
+- **executor** describes how the command is run at that placement, such as a
+  host process or a future Docker container.
+
+This produces composable combinations without introducing special runtime
+names for every pairing:
+
+| Placement | Executor | Support |
+| --- | --- | --- |
+| local | host process | supported |
+| local | Docker | future direction |
+| remote SSH | host process | future direction |
+| remote SSH | Docker | future direction |
+
+The entries marked as future direction illustrate the intended architecture;
+they are not current compatibility promises.
+
+Runtime configuration belongs below the workspace boundary. A workspace is a
+durable logical context and may provide defaults, but it should eventually be
+able to contain processes using different execution combinations. The desired
+placement and executor configuration should live on a reusable environment,
+while each process references that environment and records the resolved native
+handle, such as a local process-group ID, container ID, or remote process token.
+
+In that model, a runtime backend provides the common lifecycle contract—start,
+inspect, logs, signal, stop, kill, wait, restart, attach, remove, and recovery—
+while declaring any unsupported capabilities explicitly. The existing
+workspace-level `runtime` constraint represents the current local/host-only
+implementation, not the intended boundary for multi-runtime support.
