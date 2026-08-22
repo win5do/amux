@@ -25,47 +25,63 @@ because its unmanaged process tree may still exist.
 
 ## Runtime model and direction
 
-The current implementation supports one execution combination only:
+A runtime should be modeled as an **execution target** plus an **execution
+object**, rather than as one flat enum whose values encode every possible
+combination.
 
-- execution location: `local`;
-- execution method: a host OS process group.
+The execution target is a typed object that identifies the control domain in
+which work runs. It is more general than a `local` or `remote` flag. Examples
+include the local machine, a cloud development machine, and a cluster with a
+specific context and namespace. Connection details such as SSH or a cluster API
+are properties of the target; they are not themselves the workload being
+managed.
 
-The CLI and protocol currently identify this execution method with the runtime
-value `host`. Container and remote SSH execution are not native runtimes today.
-They can still be launched through foreground host commands, but in that case
-amux owns the local CLI process rather than the detached container, container
-application, or remote process.
+The executor resolves a command or workload specification into a typed,
+persisted execution object. That object records the native identity and
+resources that amux owns. It may represent one resource or an aggregate:
 
-Future runtime support should separate two independent concerns instead of
-adding each combination to one flat runtime enum:
-
-- **placement** describes where execution happens, such as `local` or a future
-  remote SSH endpoint;
-- **executor** describes how the command is run at that placement, such as a
-  host process or a future container.
-
-This produces composable combinations without introducing special runtime
-names for every pairing:
-
-| Placement | Executor | Support |
-| --- | --- | --- |
-| local | host process | supported |
-| local | container | future direction |
-| remote SSH | host process | future direction |
-| remote SSH | container | future direction |
+| Execution target | Execution object | Native identity | Support |
+| --- | --- | --- | --- |
+| local machine | process | PID and process-group ID | supported |
+| machine | container | container ID | future direction |
+| machine | container application | application ID and member resources | future direction |
+| cluster | resource set | resource UIDs, such as controllers, pods, and services | future direction |
 
 The entries marked as future direction illustrate the intended architecture;
-they are not current compatibility promises.
+they are not current compatibility promises. A foreground container or remote
+client launched by the current host runtime is still recorded as a local
+process, because amux owns the client process rather than the underlying
+container, application, or remote resources.
+
+Conceptually, the resolved state has this shape:
+
+```text
+runtime
+├── target: typed target configuration
+└── object
+    ├── kind: process | container | container_application | resource_set
+    ├── identity: provider-native identifiers
+    └── resources: zero or more owned resource references
+```
 
 Runtime configuration belongs below the workspace boundary. A workspace is a
 durable logical context and may provide defaults, but it should eventually be
-able to contain processes using different execution combinations. The desired
-placement and executor configuration should live on a reusable environment,
-while each process references that environment and records the resolved native
-handle, such as a local process-group ID, container ID, or remote process token.
+able to contain executions targeting different machines or clusters. A reusable
+environment stores the desired target and executor specification. The durable
+execution record references that environment and stores the resolved execution
+object. The current `Process` model is that durable execution record for the
+local-process implementation; future object kinds do not have to imply a single
+OS process.
 
-In that model, a runtime backend provides the common lifecycle contract—start,
-inspect, logs, signal, stop, kill, wait, restart, attach, remove, and recovery—
-while declaring any unsupported capabilities explicitly. The existing
-workspace-level `runtime` constraint represents the current local/host-only
-implementation, not the intended boundary for multi-runtime support.
+A runtime backend interprets its execution object when implementing the common
+lifecycle contract—start, inspect, logs, signal, stop, kill, wait, restart,
+attach, remove, and recovery. State and logs may be aggregated when the object
+owns multiple resources, while provider-native identities remain available for
+inspection and targeted operations. Backends must declare unsupported
+capabilities explicitly.
+
+Current support is limited to a local-machine target and a process execution
+object backed by an OS process group. The CLI and protocol identify this
+implementation with the runtime value `host`. The existing workspace-level
+`runtime` constraint represents that current limitation, not the intended
+boundary for future runtime support.
