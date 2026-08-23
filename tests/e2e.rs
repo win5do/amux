@@ -598,3 +598,127 @@ fn invalid_log_configuration_rejects_daemon_and_shim_startup() {
     assert!(!shim_output.status.success());
     assert!(String::from_utf8_lossy(&shim_output.stderr).contains("AMUX_LOG_BACKUP_COUNT"));
 }
+
+#[tokio::test]
+async fn tracing_diagnostics_rotate_without_copying_process_output() {
+    let _guard = E2E_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let socket = temp.path().join("amux.sock");
+    let mut daemon_process = daemon_with_env(
+        &state,
+        &socket,
+        &[
+            ("AMUX_LOG", "amux=debug"),
+            ("AMUX_LOG_ROTATE_SIZE", "384"),
+            ("AMUX_LOG_BACKUP_COUNT", "2"),
+        ],
+    );
+    ok(&state, &socket, &["workspace", "create", "diag"]);
+    ok(
+        &state,
+        &socket,
+        &[
+            "run",
+            "--workspace",
+            "diag",
+            "--name",
+            "keeper",
+            "--",
+            "/bin/sh",
+            "-c",
+            "sleep 10",
+        ],
+    );
+    for index in 0..5 {
+        let name = format!("short-{index}");
+        ok(
+            &state,
+            &socket,
+            &[
+                "run",
+                "--workspace",
+                "diag",
+                "--name",
+                &name,
+                "--",
+                "/bin/sh",
+                "-c",
+                "printf 'PROCESS_OUTPUT_SECRET'",
+            ],
+        );
+        ok(&state, &socket, &["wait", &format!("diag/{name}")]);
+    }
+    let inspect = ok(&state, &socket, &["--json", "inspect", "diag/keeper"]);
+    let value: serde_json::Value = serde_json::from_str(&inspect).unwrap();
+    let workspace_id = value["process"]["workspace_id"].as_str().unwrap();
+    let group_id = value["process"]["group_id"].as_str().unwrap();
+    ok(&state, &socket, &["stop", "--time", "100ms", "diag/keeper"]);
+    ok(&state, &socket, &["wait", "diag/keeper"]);
+    let shim_socket = Path::new("/tmp")
+        .join(format!("amux-{}", unsafe { libc::getuid() }))
+        .join("shims")
+        .join(format!("{group_id}.sock"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while shim_socket.exists() {
+        assert!(Instant::now() < deadline, "group shim did not stop");
+        thread::sleep(Duration::from_millis(20));
+    }
+    thread::sleep(Duration::from_millis(100));
+
+    let client = Client::new(Config {
+        state_dir: state.clone(),
+        socket: socket.clone(),
+    });
+    client
+        .do_empty(http::Method::POST, "/v1/admin/stop")
+        .await
+        .unwrap();
+    assert!(daemon_process.wait().unwrap().success());
+
+    let daemon_logs = read_rotating_logs(&state, "amuxd.log");
+    let workspace_dir = state.join("workspaces").join(workspace_id);
+    let shim_logs = read_rotating_logs(&workspace_dir, "shim.log");
+    assert!(daemon_logs.contains("process lifecycle"));
+    assert!(shim_logs.contains("process exited") || shim_logs.contains("process started"));
+    assert!(!daemon_logs.contains("PROCESS_OUTPUT_SECRET"));
+    assert!(!shim_logs.contains("PROCESS_OUTPUT_SECRET"));
+    let daemon_backups = rotating_backup_count(&state, "amuxd.log");
+    let shim_backups = rotating_backup_count(&workspace_dir, "shim.log");
+    assert!(daemon_backups <= 2, "daemon backups: {daemon_backups}");
+    assert!(shim_backups <= 2, "shim backups: {shim_backups}");
+    assert!(daemon_backups > 0 || shim_backups > 0);
+}
+
+fn read_rotating_logs(dir: &Path, active: &str) -> String {
+    let prefix = format!("{active}.");
+    let mut paths = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name == active || (name.starts_with(&prefix) && name.ends_with(".bak"))
+        })
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
+        .into_iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn rotating_backup_count(dir: &Path, active: &str) -> usize {
+    let prefix = format!("{active}.");
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(&prefix) && name.ends_with(".bak")
+        })
+        .count()
+}

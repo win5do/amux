@@ -15,6 +15,7 @@ use http::{Method, Request};
 use http_body_util::Full;
 use tokio::net::UnixStream;
 use tokio_tungstenite::{WebSocketStream, client_async};
+use tracing::{debug, warn};
 
 use crate::{config::Config, protocol::Response, unix_http};
 
@@ -57,6 +58,7 @@ impl Client {
     }
 
     pub async fn do_bytes(&self, method: Method, path: &str, body: Bytes) -> Result<Bytes> {
+        debug!(%method, path, daemon_name = %self.daemon_name, "daemon request");
         let request = Request::builder()
             .method(method)
             .uri(format!("http://unix{path}"))
@@ -64,6 +66,7 @@ impl Client {
             .body(Full::new(body))?;
         let response = unix_http::request(&self.config.socket, request).await?;
         if !response.status().is_success() {
+            debug!(status = %response.status(), path, "daemon request rejected");
             if let Ok(value) = serde_json::from_slice::<Response>(response.body())
                 && let Some(error) = value.error
             {
@@ -112,6 +115,7 @@ impl Client {
         arguments: Vec<String>,
     ) -> Result<()> {
         if self.ready().await {
+            debug!(daemon_name = %self.daemon_name, "daemon already ready");
             return Ok(());
         }
         std::fs::create_dir_all(&self.config.state_dir)?;
@@ -148,6 +152,7 @@ impl Client {
             });
         }
         let mut child = command.spawn()?;
+        debug!(daemon_name = %self.daemon_name, pid = child.id(), "daemon spawned; waiting for readiness");
         unsafe {
             libc::close(fds[1]);
         }
@@ -174,6 +179,7 @@ impl Client {
             .await
             .context("daemon readiness timeout")??;
         if !ok && !self.ready().await {
+            warn!(daemon_name = %self.daemon_name, "daemon readiness failed");
             let _ = child.kill();
             let _ = child.wait();
             bail!("daemon readiness failed")

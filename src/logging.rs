@@ -153,10 +153,12 @@ impl RotatingWriterInner {
         if self.config.backup_count == 0 {
             self.file = open_truncate(&self.path)?;
         } else {
+            // Make room before publishing the new backup so an abrupt process
+            // exit can never leave more files than the configured bound.
+            prune_file_backups(&self.path, self.config.backup_count - 1)?;
             let backup = unique_backup_path(&self.path);
             fs::rename(&self.path, backup)?;
             self.file = open_append(&self.path)?;
-            prune_file_backups(&self.path, self.config.backup_count)?;
         }
         self.size = 0;
         Ok(())

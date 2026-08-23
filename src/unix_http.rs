@@ -7,6 +7,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use tokio::net::UnixStream;
+use tracing::debug;
 
 pub async fn request_stream(
     socket: &Path,
@@ -21,7 +22,9 @@ pub async fn request_stream(
         .with_context(|| format!("connect {}", socket.display()))?;
     let (mut sender, connection) = http1::handshake(TokioIo::new(stream)).await?;
     tokio::spawn(async move {
-        let _ = connection.await;
+        if let Err(error) = connection.await {
+            debug!(%error, "unix HTTP connection ended with an error");
+        }
     });
     Ok(sender.send_request(request).await?)
 }

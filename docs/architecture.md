@@ -37,6 +37,15 @@ in-process rotating writer. Their active `amuxd.log` and `shim.log` files use
 the same configurable size/count policy as process output and retain
 timestamped file backups.
 
+Internal daemon and shim observability is emitted as compact `tracing` events
+to stderr, which is captured by that rotating writer. `AMUX_LOG` (then
+`RUST_LOG`) controls filtering. Diagnostic spans carry stable control-plane
+identifiers, while managed stdout/stderr/TTY bytes remain exclusively in the
+`OutputEvent` data plane. CLI JSON and human-facing output are a third, public
+interface and are never produced through tracing. The panic hook also emits
+through tracing once diagnostics have initialized; bootstrap failures still
+fall back to the inherited stderr file descriptor.
+
 Restarted daemons discover processes from disk and reconnect to their shim
 sockets. A live-looking record whose shim cannot be reached becomes `unknown`.
 An unknown process from the current boot is not restarted automatically,

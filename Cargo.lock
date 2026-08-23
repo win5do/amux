@@ -40,6 +40,7 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite 0.27.0",
  "tracing",
+ "tracing-panic",
  "tracing-subscriber",
  "url",
  "uuid",
@@ -1513,6 +1514,16 @@ dependencies = [
  "log",
  "once_cell",
  "tracing-core",
+]
+
+[[package]]
+name = "tracing-panic"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7bf1298a179837099f9309243af3b554e840f7f67f65e9f55294913299bd4cc5"
+dependencies = [
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

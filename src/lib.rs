@@ -3,6 +3,7 @@ pub mod config;
 pub mod daemon;
 pub mod logging;
 pub mod model;
+pub mod observability;
 pub mod output;
 pub mod protocol;
 pub mod shim;

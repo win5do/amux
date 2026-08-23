@@ -87,6 +87,11 @@ the same defaults. Override them only when needed with
 `AMUX_LOG_ROTATE_SIZE` (default `64MiB`) and `AMUX_LOG_BACKUP_COUNT` (default
 `2`, allowed `0..16`).
 
+Daemon and shim diagnostics are compact tracing logs in `amuxd.log` and the
+workspace `shim.log`. Set `AMUX_LOG=amux=debug` before starting the daemon for
+deeper control-plane diagnostics. These files do not contain managed process
+stdout/stderr/TTY data; continue to use `amux logs` for that output.
+
 ## Attach to TTYs
 
 ```bash

@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use chrono::Utc;
 use serde::Serialize;
+use tracing::{debug, warn};
 
 use crate::{
     logging::LogConfig,
@@ -60,6 +61,13 @@ impl RecordReader {
                 requested_after: after,
                 oldest_available,
             });
+        if let Some(gap) = &gap {
+            warn!(
+                requested_after = gap.requested_after,
+                oldest_available = gap.oldest_available,
+                "output history gap"
+            );
+        }
         Ok(Self {
             generations: generations.into(),
             after,
@@ -359,11 +367,13 @@ impl OutputLog {
                 fs::remove_dir_all(&current)?;
             }
             fs::create_dir_all(&current)?;
+            debug!(process_dir = %self.process_dir.display(), "output generation discarded and recreated");
             return Ok(());
         }
         let backup = unique_generation_path(&self.process_dir.join("output"));
         fs::rename(&current, backup)?;
         fs::create_dir_all(&current)?;
+        debug!(process_dir = %self.process_dir.display(), "output generation rotated");
         prune_generations(&self.process_dir.join("output"), self.config.backup_count)
     }
 
@@ -388,6 +398,7 @@ impl OutputLog {
             fs::create_dir_all(self.current_dir())?;
             return Ok(());
         }
+        debug!(process_dir = %self.process_dir.display(), "migrating legacy output layout");
         let staging = output.join(format!(".migrate-{}", uuid::Uuid::new_v4().simple()));
         fs::create_dir(&staging)?;
         for entry in fs::read_dir(&self.process_dir)? {

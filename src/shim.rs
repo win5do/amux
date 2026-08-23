@@ -35,10 +35,12 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::{net::UnixListener, sync::broadcast};
 use tokio_stream::wrappers::BroadcastStream;
+use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use crate::{
     logging::{LogConfig, install_process_log},
-    model::{IoMode, Process, ProcessState, SignalRequest, StopRequest},
+    model::{Group, IoMode, Process, ProcessState, SignalRequest, StopRequest},
+    observability::{self, ProcessRole},
     output::{OutputLog, OutputState, RecordReader},
     store::{atomic_json, read_json},
 };
@@ -106,6 +108,23 @@ impl GroupShim {
         if lifecycle_fd.is_some() {
             install_process_log(self.workspace_dir.join("shim.log"), self.log_config)?;
         }
+        observability::init(ProcessRole::Shim)?;
+        let group = read_json::<Group>(self.workspace_dir.join("group.json")).ok();
+        let span = info_span!(
+            "group_shim",
+            component = "shim",
+            workspace_id = group
+                .as_ref()
+                .map_or("", |value| value.workspace_id.as_str()),
+            group_id = group.as_ref().map_or("", |value| value.id.as_str()),
+            pid = std::process::id()
+        );
+        self.serve_runtime(ready_fd, lifecycle_fd)
+            .instrument(span)
+            .await
+    }
+
+    async fn serve_runtime(self, ready_fd: Option<i32>, lifecycle_fd: Option<i32>) -> Result<()> {
         if let Some(parent) = self.socket.parent() {
             fs::create_dir_all(parent)?;
             fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
@@ -131,6 +150,7 @@ impl GroupShim {
         if let Some(fd) = ready_fd {
             write_ready(fd);
         }
+        info!(socket = %self.socket.display(), "group shim ready");
         let idle_group = self.clone();
         let mut lifecycle = self.lifecycle.subscribe();
         tokio::spawn(async move {
@@ -140,6 +160,7 @@ impl GroupShim {
                         if process.state.terminal() {
                             let mut processes = idle_group.processes.lock().unwrap();
                             processes.remove(&process.id);
+                            debug!(process_id = %process.id, "terminal supervisor unloaded");
                             if processes.is_empty() {
                                 drop(processes);
                                 idle_group.shutdown.notify_waiters();
@@ -180,6 +201,7 @@ impl GroupShim {
         };
         let _ = fs::remove_file(&self.socket);
         result?;
+        info!("group shim stopped");
         Ok(())
     }
 
@@ -198,6 +220,7 @@ impl GroupShim {
         for shim in &shims {
             let pgid = shim.inner.lock().unwrap().process.process_group_id;
             if pgid > 0 && !shim.inner.lock().unwrap().process.state.terminal() {
+                warn!(process_id = %shim.inner.lock().unwrap().process.id, pgid, "terminating process after lifeline closed");
                 let _ = killpg(Pid::from_raw(pgid), Signal::SIGTERM);
             }
         }
@@ -205,6 +228,7 @@ impl GroupShim {
         for shim in shims {
             let inner = shim.inner.lock().unwrap();
             if inner.process.process_group_id > 0 && !inner.process.state.terminal() {
+                warn!(process_id = %inner.process.id, pgid = inner.process.process_group_id, "forcing process termination");
                 let _ = killpg(
                     Pid::from_raw(inner.process.process_group_id),
                     Signal::SIGKILL,
@@ -374,8 +398,8 @@ impl Shim {
         })
     }
 
-    fn publish_lifecycle(&self, process: Process) {
-        let _ = self.lifecycle.send(process);
+    fn publish_lifecycle(&self, process: &Process) {
+        let _ = self.lifecycle.send(process.clone());
     }
 
     pub async fn serve(self, ready_fd: Option<i32>) -> Result<()> {
@@ -389,7 +413,11 @@ impl Shim {
             inner.process.state = ProcessState::Failed;
             inner.process.error = error.to_string();
             inner.process.finished_at = Some(Utc::now());
-            let _ = atomic_json(&self.dir.join("metadata.json"), &inner.process);
+            if let Err(persist_error) = atomic_json(&self.dir.join("metadata.json"), &inner.process)
+            {
+                error!(error = %persist_error, process_id = %inner.process.id, "persist process startup failure failed");
+            }
+            error!(%error, process_id = %inner.process.id, "process startup failed");
             return Err(error);
         }
         let listener = UnixListener::bind(&self.socket)?;
@@ -473,7 +501,8 @@ impl Shim {
             atomic_json(&self.dir.join("metadata.json"), &inner.process)?;
             inner.process.clone()
         };
-        self.publish_lifecycle(running);
+        self.publish_lifecycle(&running);
+        info!(process_id = %process.id, execution = process.execution, pid, io_mode = "pipe", "process started");
         self.spawn_wait_pipe(child);
         Ok(())
     }
@@ -508,7 +537,8 @@ impl Shim {
             atomic_json(&self.dir.join("metadata.json"), &inner.process)?;
             inner.process.clone()
         };
-        self.publish_lifecycle(running);
+        self.publish_lifecycle(&running);
+        info!(process_id = %process.id, execution = process.execution, pid, io_mode = "tty", "process started");
         self.spawn_reader("tty", reader);
         self.spawn_wait_pty(child);
         Ok(())
@@ -521,7 +551,11 @@ impl Shim {
             let mut buffer = [0u8; 16 * 1024];
             loop {
                 match reader.read(&mut buffer) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
+                    Err(error) => {
+                        warn!(%error, process_id = %shim.inner.lock().unwrap().process.id, stream, "process output reader failed");
+                        break;
+                    }
                     Ok(count) => shim.emit(stream, &buffer[..count]),
                 }
             }
@@ -534,11 +568,11 @@ impl Shim {
     fn emit(&self, stream: &str, bytes: &[u8]) {
         let mut inner = self.inner.lock().unwrap();
         let execution = inner.process.execution;
-        if self
+        if let Err(error) = self
             .output_log
             .append(&mut inner.output, stream, bytes, execution)
-            .is_err()
         {
+            error!(%error, process_id = %inner.process.id, execution, stream, "persist process output failed");
             return;
         }
         inner.replay.extend(bytes);
@@ -582,11 +616,14 @@ impl Shim {
             inner.process.state = ProcessState::Exited;
             inner.process.finished_at = Some(Utc::now());
             inner.input = None;
-            let _ = atomic_json(&self.dir.join("metadata.json"), &inner.process);
+            if let Err(error) = atomic_json(&self.dir.join("metadata.json"), &inner.process) {
+                error!(%error, process_id = %inner.process.id, "persist terminal process state failed");
+            }
             let message = serde_json::to_string(&json!({"type":"exit","exit_code":inner.process.exit_code,"signal":inner.process.exit_signal})).unwrap_or_default();
             (inner.process.clone(), message)
         };
-        self.publish_lifecycle(process);
+        self.publish_lifecycle(&process);
+        info!(process_id = %process.id, execution = process.execution, exit_code = ?process.exit_code, signal = %process.exit_signal, "process exited");
         let _ = self.output.send(WireMessage::Text(message));
     }
 
@@ -596,10 +633,14 @@ impl Shim {
             inner.process.state = ProcessState::Failed;
             inner.process.error = error.to_string();
             inner.process.finished_at = Some(Utc::now());
-            let _ = atomic_json(&self.dir.join("metadata.json"), &inner.process);
+            if let Err(persist_error) = atomic_json(&self.dir.join("metadata.json"), &inner.process)
+            {
+                error!(error = %persist_error, process_id = %inner.process.id, "persist failed process state failed");
+            }
             inner.process.clone()
         };
-        self.publish_lifecycle(process);
+        self.publish_lifecycle(&process);
+        error!(process_id = %process.id, execution = process.execution, error = %process.error, "process wait failed");
         let _ = self.output.send(WireMessage::Text(
             serde_json::to_string(&json!({"type":"exit","error":"process wait failed"}))
                 .unwrap_or_default(),
@@ -612,11 +653,17 @@ async fn status(State(shim): State<Shim>) -> Json<Process> {
 }
 
 async fn signal(State(shim): State<Shim>, Json(request): Json<SignalRequest>) -> Response {
-    let pgid = shim.inner.lock().unwrap().process.process_group_id;
+    let (pgid, process_id) = {
+        let inner = shim.inner.lock().unwrap();
+        (inner.process.process_group_id, inner.process.id.clone())
+    };
     match parse_signal(&request.signal)
         .and_then(|sig| killpg(Pid::from_raw(pgid), sig).map_err(anyhow::Error::from))
     {
-        Ok(()) => Json(json!({"ok":true})).into_response(),
+        Ok(()) => {
+            debug!(%process_id, signal = %request.signal, "signal delivered");
+            Json(json!({"ok":true})).into_response()
+        }
         Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     }
 }
@@ -628,10 +675,13 @@ async fn stop(State(shim): State<Shim>, Json(request): Json<StopRequest>) -> Res
             return Json(json!({"ok":true})).into_response();
         }
         inner.process.state = ProcessState::Stopping;
-        let _ = atomic_json(&shim.dir.join("metadata.json"), &inner.process);
+        if let Err(error) = atomic_json(&shim.dir.join("metadata.json"), &inner.process) {
+            error!(%error, process_id = %inner.process.id, "persist stopping process state failed");
+        }
         (inner.process.process_group_id, inner.process.clone())
     };
-    shim.publish_lifecycle(process);
+    shim.publish_lifecycle(&process);
+    info!(process_id = %process.id, grace_millis = request.grace_millis, "stopping process");
     let _ = killpg(Pid::from_raw(pgid), Signal::SIGTERM);
     let delayed = shim.clone();
     tokio::spawn(async move {
@@ -642,6 +692,7 @@ async fn stop(State(shim): State<Shim>, Json(request): Json<StopRequest>) -> Res
         };
         tokio::time::sleep(Duration::from_millis(grace as u64)).await;
         if !delayed.inner.lock().unwrap().process.state.terminal() {
+            warn!(process_id = %delayed.inner.lock().unwrap().process.id, "grace period expired; sending SIGKILL");
             let _ = killpg(Pid::from_raw(pgid), Signal::SIGKILL);
         }
     });
@@ -747,6 +798,9 @@ async fn attach(
         if !query.readonly {
             if inner.controller.is_some() && !query.takeover {
                 return (StatusCode::CONFLICT, "controller already exists").into_response();
+            }
+            if inner.controller.is_some() && query.takeover {
+                info!(process_id = %inner.process.id, "TTY controller taken over");
             }
             inner.controller = Some(id);
         }

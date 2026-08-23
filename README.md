@@ -73,6 +73,8 @@ Configuration:
   zero).
 - `AMUX_LOG_BACKUP_COUNT`: retained rotated generations (default `2`, range
   `0..16`).
+- `AMUX_LOG`: tracing filter for daemon/shim diagnostics. It takes precedence
+  over `RUST_LOG` and defaults to `amux=info`.
 - State directories are mode `0700`; sockets and state files are mode `0600`.
 
 `amux daemon rm <name>` permanently deletes all persistent state for a named
@@ -87,6 +89,13 @@ first. When `--after` points into discarded history, JSONL output includes a
 `gap` record and plain output reports the gap on stderr before continuing with
 the oldest retained output. `amuxd.log` and workspace `shim.log` use the same
 size and backup-count policy with `<name>.<timestamp>.bak` backups.
+
+Daemon and shim diagnostics use compact `tracing` output. They include stable
+daemon, workspace, group, process, and execution identifiers, but never managed
+process output, environment variables, request bodies, or terminal bytes.
+Ordinary CLI tables/JSON and managed process `OutputEvent` streams remain
+separate public output planes. Panic information is routed through the same
+diagnostic pipeline after startup.
 
 The distributable Codex Skill lives at [`skills/amux`](skills/amux). Install or
 link that directory as `amux` in the active Codex skills home. Treefold-managed

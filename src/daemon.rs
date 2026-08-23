@@ -39,11 +39,13 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Notify, broadcast};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_tungstenite::{client_async, tungstenite};
+use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use crate::{
     config::{Config, boot_id},
     logging::{LogConfig, install_process_log},
     model::*,
+    observability::{self, ProcessRole},
     output::RecordReader,
     protocol::Response,
     store::Store,
@@ -178,7 +180,23 @@ impl Daemon {
         if !self.embedded_shims {
             install_process_log(self.config.state_dir.join("amuxd.log"), self.log_config)?;
         }
-        let _ = fs::remove_file(&self.config.socket);
+        observability::init(ProcessRole::Daemon)?;
+        let daemon_name = std::env::var("AMUX_DAEMON").unwrap_or_else(|_| "default".into());
+        let span = info_span!(
+            "daemon",
+            component = "daemon",
+            daemon_name,
+            daemon_instance_id = self.instance_id.as_str(),
+            pid = std::process::id()
+        );
+        self.serve_runtime(ready_fd, lock).instrument(span).await
+    }
+
+    async fn serve_runtime(self, ready_fd: Option<i32>, lock: fs::File) -> Result<()> {
+        if self.config.socket.exists() {
+            debug!(socket = %self.config.socket.display(), "removing stale daemon socket");
+            let _ = fs::remove_file(&self.config.socket);
+        }
         let listener = UnixListener::bind(&self.config.socket)?;
         fs::set_permissions(&self.config.socket, fs::Permissions::from_mode(0o600))?;
         if let Some(fd) = ready_fd {
@@ -186,6 +204,7 @@ impl Daemon {
         }
 
         self.write_registration()?;
+        info!(socket = %self.config.socket.display(), "daemon ready");
         let monitor = self.clone();
         tokio::spawn(async move { monitor.consistency_loop().await });
         let idle = self.clone();
@@ -257,12 +276,14 @@ impl Daemon {
             value = &mut server => value,
             _ = async move { tokio::select! { _ = shutdown_signal() => {}, _ = stopping.notified() => {} } } => Ok(()),
         };
+        info!("daemon shutdown requested");
         self.stop_all_processes().await;
         self.group_lifelines.lock().unwrap().clear();
         let _ = fs::remove_file(&self.config.socket);
         let _ = fs::remove_file(self.config.state_dir.join("daemon.json"));
         drop(lock);
         result?;
+        info!("daemon stopped");
         Ok(())
     }
 
@@ -297,7 +318,9 @@ impl Daemon {
             if self.embedded_shims {
                 let group = crate::shim::GroupShim::load(&workspace_dir, &socket)?;
                 tokio::spawn(async move {
-                    let _ = group.serve(None, None).await;
+                    if let Err(error) = group.serve(None, None).await {
+                        error!(%error, "embedded group shim failed");
+                    }
                 });
                 for _ in 0..100 {
                     if socket.exists() {
@@ -316,6 +339,7 @@ impl Daemon {
                     .unwrap()
                     .insert(group_id, lifeline);
             }
+            info!(group_id = %process.group_id, workspace_id = %process.workspace_id, "group shim launched");
         }
         self.ensure_group_event_bridge(process.group_id.clone(), socket.clone());
         unix_http::json_request::<serde_json::Value>(
@@ -365,6 +389,7 @@ impl Daemon {
                     && let Ok(response) = unix_http::request_stream(&socket, request).await
                     && response.status().is_success()
                 {
+                    debug!(group_id = %group_id, "group event bridge connected");
                     retry_delay = Duration::from_millis(250);
                     let mut body = response.into_body();
                     let mut pending = Vec::new();
@@ -382,11 +407,13 @@ impl Daemon {
                 if !socket.exists() {
                     break;
                 }
+                warn!(group_id = %group_id, delay_ms = retry_delay.as_millis(), "group event bridge disconnected; retrying");
                 tokio::time::sleep(retry_delay).await;
                 retry_delay = (retry_delay * 2).min(Duration::from_secs(10));
             }
             daemon.group_event_bridges.lock().unwrap().remove(&group_id);
             daemon.group_lifelines.lock().unwrap().remove(&group_id);
+            debug!(group_id = %group_id, "group event bridge removed");
         });
     }
 
@@ -414,7 +441,9 @@ impl Daemon {
             kind
         };
         let terminal = process.state.terminal();
-        let _ = self.store.save_process(&process);
+        if let Err(error) = self.store.save_process(&process) {
+            error!(%error, process_id = %process.id, "persist process observation failed");
+        }
         self.emit(kind, process.clone());
         if terminal {
             self.events.lock().unwrap().fingerprints.remove(&process.id);
@@ -470,7 +499,7 @@ impl Daemon {
                 hub.fingerprints.insert(process.id.clone(), fingerprint);
             }
             let event = ProcessEvent {
-                kind,
+                kind: kind.clone(),
                 daemon_instance_id: self.instance_id.as_ref().clone(),
                 sequence: hub.sequence,
                 timestamp: chrono::Utc::now(),
@@ -488,6 +517,28 @@ impl Daemon {
             event
         };
         let _ = self.event_tx.send(event);
+        match kind {
+            ProcessEventKind::ProcessCreated
+            | ProcessEventKind::ProcessStarted
+            | ProcessEventKind::ProcessExited
+            | ProcessEventKind::ProcessRemoved => info!(
+                event = ?kind,
+                workspace_id = %process.workspace_id,
+                group_id = %process.group_id,
+                process_id = %process.id,
+                execution = process.execution,
+                state = ?process.state,
+                "process lifecycle"
+            ),
+            ProcessEventKind::ProcessUpdated => debug!(
+                workspace_id = %process.workspace_id,
+                group_id = %process.group_id,
+                process_id = %process.id,
+                execution = process.execution,
+                state = ?process.state,
+                "process updated"
+            ),
+        }
         self.update_registration_counts();
     }
 
@@ -510,7 +561,9 @@ impl Daemon {
             .len();
         value["active_processes"] = json!(active.len());
         value["active_groups"] = json!(groups);
-        let _ = crate::store::atomic_json(&path, &value);
+        if let Err(error) = crate::store::atomic_json(&path, &value) {
+            warn!(%error, "update daemon registration counts failed");
+        }
     }
 
     async fn consistency_loop(&self) {
@@ -519,7 +572,14 @@ impl Daemon {
             if !self.config.socket.exists() {
                 continue;
             }
-            for process in self.store.list_processes(None).unwrap_or_default() {
+            let processes = match self.store.list_processes(None) {
+                Ok(processes) => processes,
+                Err(error) => {
+                    warn!(%error, "consistency scan failed");
+                    continue;
+                }
+            };
+            for process in processes {
                 if !process.state.terminal() {
                     self.observe_process(process);
                 }
@@ -717,7 +777,9 @@ async fn list_workspaces(State(daemon): State<Daemon>) -> AxumResponse {
                 } else {
                     WorkspaceState::Idle
                 };
-                let _ = daemon.store.save_workspace(workspace);
+                if let Err(error) = daemon.store.save_workspace(workspace) {
+                    warn!(%error, workspace_id = %workspace.id, "persist workspace state failed");
+                }
             }
             let mut response = Response::ok();
             response.workspaces = workspaces;
@@ -835,9 +897,11 @@ async fn run_process(
         ),
     ]);
     if let Err(error) = daemon.store.save_runtime_env(&process, &runtime_env) {
+        error!(%error, process_id = %process.id, "persist process runtime environment failed");
         return api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", error);
     }
     if let Err(error) = daemon.launch_shim(&mut process).await {
+        error!(%error, process_id = %process.id, group_id = %process.group_id, "launch process supervisor failed");
         return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "process_start_failed",
@@ -880,7 +944,10 @@ async fn list_processes(
             {
                 process.state = ProcessState::Unknown;
                 process.error = "shim unavailable".into();
-                let _ = daemon.store.save_process(process);
+                if let Err(error) = daemon.store.save_process(process) {
+                    error!(%error, process_id = %process.id, "persist unknown process state failed");
+                }
+                warn!(process_id = %process.id, group_id = %process.group_id, "live process shim is unavailable");
             }
             Err(_) => {}
         }
@@ -1197,9 +1264,11 @@ async fn restart_process(daemon: Daemon, mut process: Process) -> AxumResponse {
     process.started_at = None;
     process.finished_at = None;
     if let Err(error) = daemon.store.save_process(&process) {
+        error!(%error, process_id = %process.id, "persist process restart state failed");
         return api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", error);
     }
     if let Err(error) = daemon.launch_shim(&mut process).await {
+        error!(%error, process_id = %process.id, group_id = %process.group_id, "restart process supervisor failed");
         return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "process_start_failed",

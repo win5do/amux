@@ -30,3 +30,7 @@ removal succeeds with `removed:false`.
 `GET /v1/processes/{target}/attach` upgrades to WebSocket. Binary frames are
 raw terminal bytes. JSON frames carry `resize`, `signal`, and `exit` messages.
 Query parameters are `readonly`, `takeover`, and `replay_bytes`.
+
+Daemon/shim tracing diagnostics are not part of the control protocol. They are
+written only to `amuxd.log` and workspace `shim.log`; they never appear in HTTP
+responses, CLI JSON, or process log NDJSON.
