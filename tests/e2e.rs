@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use amux::{client::Client, config::Config};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use std::{
@@ -300,6 +301,271 @@ async fn tty_attach_and_controller_ownership() {
     assert!(followed.contains("first") && followed.contains("second"));
     ok(&state, &socket, &["wait", "dev/follow"]);
     ok(&state, &socket, &["rm", "dev/follow"]);
+    ok(&state, &socket, &["workspace", "rm", "dev"]);
+    daemon_process.kill().unwrap();
+    let _ = daemon_process.wait();
+}
+
+#[tokio::test]
+async fn acknowledged_tty_input_survives_reconnect_without_duplicates() {
+    let _guard = E2E_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let socket = temp.path().join("amux.sock");
+    let mut daemon_process = daemon(&state, &socket);
+
+    ok(&state, &socket, &["workspace", "create", "dev"]);
+    ok(
+        &state,
+        &socket,
+        &[
+            "run",
+            "--workspace",
+            "dev",
+            "--name",
+            "reliable",
+            "--tty",
+            "--",
+            "/bin/sh",
+            "-c",
+            "IFS= read -r first; IFS= read -r second; printf 'TTY:%s:%s\\n' \"$first\" \"$second\"",
+        ],
+    );
+    let client = Client::new(Config {
+        state_dir: state.clone(),
+        socket: socket.clone(),
+    });
+    let path = "/v1/processes/dev/reliable/attach?takeover=true&replay_bytes=0&input_protocol=acked-v1&input_client_id=browser-1";
+    let mut first = client.attach(path).await.unwrap();
+    first
+        .send(Message::Text(
+            serde_json::json!({"type":"input","sequence":1,"data":BASE64.encode(b"alpha\n")})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(message) = first.next().await {
+            if let Message::Text(text) = message.unwrap()
+                && text.contains("\"type\":\"input_ack\"")
+                && text.contains("\"sequence\":1")
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    drop(first);
+
+    let mut second = client.attach(path).await.unwrap();
+    for (sequence, data) in [(1, b"alpha\n".as_slice()), (2, b"beta\n".as_slice())] {
+        second
+            .send(Message::Text(
+                serde_json::json!({"type":"input","sequence":sequence,"data":BASE64.encode(data)})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+    }
+    let output = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut bytes = Vec::new();
+        while let Some(message) = second.next().await {
+            match message.unwrap() {
+                Message::Binary(value) => {
+                    bytes.extend_from_slice(&value);
+                    if bytes.windows(14).any(|value| value == b"TTY:alpha:beta") {
+                        break;
+                    }
+                }
+                Message::Text(value) if value.contains("\"type\":\"exit\"") => break,
+                _ => {}
+            }
+        }
+        bytes
+    })
+    .await
+    .unwrap();
+    assert!(String::from_utf8_lossy(&output).contains("TTY:alpha:beta"));
+
+    let waited = ok(&state, &socket, &["--json", "wait", "dev/reliable"]);
+    assert!(waited.contains("\"exit_code\":0"));
+    ok(&state, &socket, &["rm", "dev/reliable"]);
+    ok(&state, &socket, &["workspace", "rm", "dev"]);
+    daemon_process.kill().unwrap();
+    let _ = daemon_process.wait();
+}
+
+#[tokio::test]
+async fn acknowledged_tty_input_rejects_a_displaced_controller() {
+    let _guard = E2E_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let socket = temp.path().join("amux.sock");
+    let mut daemon_process = daemon(&state, &socket);
+
+    ok(&state, &socket, &["workspace", "create", "dev"]);
+    ok(
+        &state,
+        &socket,
+        &[
+            "run",
+            "--workspace",
+            "dev",
+            "--name",
+            "takeover",
+            "--tty",
+            "--",
+            "/bin/sh",
+            "-c",
+            "IFS= read -r value; printf 'TTY:%s\\n' \"$value\"",
+        ],
+    );
+    let client = Client::new(Config {
+        state_dir: state.clone(),
+        socket: socket.clone(),
+    });
+    let mut displaced = client
+        .attach("/v1/processes/dev/takeover/attach?takeover=true&replay_bytes=0&input_protocol=acked-v1&input_client_id=old")
+        .await
+        .unwrap();
+    let mut controller = client
+        .attach("/v1/processes/dev/takeover/attach?takeover=true&replay_bytes=0&input_protocol=acked-v1&input_client_id=new")
+        .await
+        .unwrap();
+    displaced
+        .send(Message::Text(
+            serde_json::json!({"type":"input","sequence":1,"data":BASE64.encode(b"lost\n")})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let rejected = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(message) = displaced.next().await {
+            if let Message::Text(text) = message.unwrap()
+                && text.contains("\"type\":\"input_rejected\"")
+            {
+                return text.to_string();
+            }
+        }
+        String::new()
+    })
+    .await
+    .unwrap();
+    assert!(rejected.contains("\"code\":\"ownership_lost\""));
+
+    controller
+        .send(Message::Text(
+            serde_json::json!({"type":"input","sequence":1,"data":BASE64.encode(b"kept\n")})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut bytes = Vec::new();
+        while let Some(message) = controller.next().await {
+            match message.unwrap() {
+                Message::Binary(value) => {
+                    bytes.extend_from_slice(&value);
+                    if bytes.windows(8).any(|value| value == b"TTY:kept") {
+                        break;
+                    }
+                }
+                Message::Text(value) if value.contains("\"type\":\"exit\"") => break,
+                _ => {}
+            }
+        }
+        bytes
+    })
+    .await
+    .unwrap();
+    assert!(String::from_utf8_lossy(&output).contains("TTY:kept"));
+
+    let _ = ok(&state, &socket, &["--json", "wait", "dev/takeover"]);
+    ok(&state, &socket, &["rm", "dev/takeover"]);
+    ok(&state, &socket, &["workspace", "rm", "dev"]);
+    daemon_process.kill().unwrap();
+    let _ = daemon_process.wait();
+}
+
+#[tokio::test]
+async fn acknowledged_tty_input_preserves_a_rapid_key_burst() {
+    let _guard = E2E_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let socket = temp.path().join("amux.sock");
+    let mut daemon_process = daemon(&state, &socket);
+
+    ok(&state, &socket, &["workspace", "create", "dev"]);
+    ok(
+        &state,
+        &socket,
+        &[
+            "run",
+            "--workspace",
+            "dev",
+            "--name",
+            "burst",
+            "--tty",
+            "--",
+            "/bin/sh",
+            "-c",
+            "IFS= read -r value; printf 'COUNT:%s\\n' \"${#value}\"",
+        ],
+    );
+    let client = Client::new(Config {
+        state_dir: state.clone(),
+        socket: socket.clone(),
+    });
+    let mut terminal = client
+        .attach("/v1/processes/dev/burst/attach?takeover=true&replay_bytes=0&input_protocol=acked-v1&input_client_id=burst")
+        .await
+        .unwrap();
+    for sequence in 1..=500 {
+        terminal
+            .send(Message::Text(
+                serde_json::json!({"type":"input","sequence":sequence,"data":BASE64.encode(b"x")})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+    }
+    terminal
+        .send(Message::Text(
+            serde_json::json!({"type":"input","sequence":501,"data":BASE64.encode(b"\n")})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+
+    let output = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut bytes = Vec::new();
+        while let Some(message) = terminal.next().await {
+            match message.unwrap() {
+                Message::Binary(value) => {
+                    bytes.extend_from_slice(&value);
+                    if bytes.windows(9).any(|value| value == b"COUNT:500") {
+                        break;
+                    }
+                }
+                Message::Text(value) if value.contains("\"type\":\"exit\"") => break,
+                _ => {}
+            }
+        }
+        bytes
+    })
+    .await
+    .unwrap();
+    assert!(String::from_utf8_lossy(&output).contains("COUNT:500"));
+
+    let _ = ok(&state, &socket, &["--json", "wait", "dev/burst"]);
+    ok(&state, &socket, &["rm", "dev/burst"]);
     ok(&state, &socket, &["workspace", "rm", "dev"]);
     daemon_process.kill().unwrap();
     let _ = daemon_process.wait();

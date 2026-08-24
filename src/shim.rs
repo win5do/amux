@@ -23,6 +23,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{any, get, post},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bytes::Bytes;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
@@ -33,7 +34,10 @@ use nix::{
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::Deserialize;
 use serde_json::json;
-use tokio::{net::UnixListener, sync::broadcast};
+use tokio::{
+    net::UnixListener,
+    sync::{broadcast, mpsc},
+};
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
@@ -46,6 +50,8 @@ use crate::{
 };
 
 const REPLAY_LIMIT: usize = 4 * 1024 * 1024;
+const ACKNOWLEDGED_INPUT_PROTOCOL: &str = "acked-v1";
+const MAX_ACKNOWLEDGED_INPUT_CLIENTS: usize = 64;
 
 struct Inner {
     process: Process,
@@ -55,6 +61,8 @@ struct Inner {
     replay: VecDeque<u8>,
     controller: Option<u64>,
     next_attach: u64,
+    acknowledged_input: BTreeMap<String, u64>,
+    acknowledged_input_order: VecDeque<String>,
 }
 
 #[derive(Clone)]
@@ -390,6 +398,8 @@ impl Shim {
                 replay,
                 controller: None,
                 next_attach: 0,
+                acknowledged_input: BTreeMap::new(),
+                acknowledged_input_order: VecDeque::new(),
             })),
             output,
             lifecycle,
@@ -778,6 +788,8 @@ struct AttachQuery {
     takeover: bool,
     #[serde(default = "default_replay")]
     replay_bytes: usize,
+    input_protocol: Option<String>,
+    input_client_id: Option<String>,
 }
 fn default_replay() -> usize {
     8192
@@ -790,6 +802,25 @@ async fn attach(
 ) -> Response {
     if shim.inner.lock().unwrap().process.io_mode != IoMode::Tty {
         return (StatusCode::CONFLICT, "process has no TTY").into_response();
+    }
+    if query
+        .input_protocol
+        .as_deref()
+        .is_some_and(|value| value != ACKNOWLEDGED_INPUT_PROTOCOL)
+        || query.input_protocol.is_some() != query.input_client_id.is_some()
+        || query.input_client_id.as_deref().is_some_and(|value| {
+            value.is_empty()
+                || value.len() > 128
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        })
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "invalid acknowledged input protocol",
+        )
+            .into_response();
     }
     let id = {
         let mut inner = shim.inner.lock().unwrap();
@@ -825,6 +856,7 @@ async fn attach_socket(shim: Shim, socket: WebSocket, id: u64, query: AttachQuer
         return;
     }
     let mut output = shim.output.subscribe();
+    let (reply_tx, mut reply_rx) = mpsc::channel::<String>(64);
     if !query.readonly {
         let notice = serde_json::to_string(
             &json!({"type":"ownership_changed","controller":id,"takeover":query.takeover}),
@@ -846,41 +878,173 @@ async fn attach_socket(shim: Shim, socket: WebSocket, id: u64, query: AttachQuer
         release(&shim, id);
         return;
     }
-    loop {
-        tokio::select! {
-            received = output.recv() => match received {
-                Ok(WireMessage::Binary(data)) => if sink.send(Message::Binary(data.into())).await.is_err() { break; },
-                Ok(WireMessage::Text(text)) => if sink.send(Message::Text(text.into())).await.is_err() { break; },
-                Err(_) => break,
-            },
-            message = futures_util::StreamExt::next(&mut source) => match message {
-                Some(Ok(Message::Binary(data))) if !query.readonly => {
-                    let failed = {
-                        let mut inner = shim.inner.lock().unwrap();
-                        inner.controller == Some(id)
-                            && inner.input.as_mut().is_some_and(|input| {
-                                input.write_all(&data).and_then(|_| input.flush()).is_err()
-                            })
-                    };
-                    if failed {
-                        let message = serde_json::to_string(&json!({"type":"input_error","code":"pty_write_failed"})).unwrap_or_default();
-                        let _ = sink.send(Message::Text(message.into())).await;
+    let acknowledged_client = query.input_client_id.clone();
+    let send_output = async {
+        loop {
+            tokio::select! {
+                received = output.recv() => match received {
+                    Ok(WireMessage::Binary(data)) => if sink.send(Message::Binary(data.into())).await.is_err() { break; },
+                    Ok(WireMessage::Text(text)) => if sink.send(Message::Text(text.into())).await.is_err() { break; },
+                    Err(_) => break,
+                },
+                reply = reply_rx.recv() => match reply {
+                    Some(text) => if sink.send(Message::Text(text.into())).await.is_err() { break; },
+                    None => break,
+                },
+            }
+        }
+    };
+    let receive_input = async {
+        loop {
+            match futures_util::StreamExt::next(&mut source).await {
+                Some(Ok(Message::Binary(data)))
+                    if !query.readonly && acknowledged_client.is_none() =>
+                {
+                    let result = write_unacknowledged_input(&shim, id, &data);
+                    if let Some(message) = result {
+                        let _ = reply_tx.send(message).await;
                         break;
                     }
                 }
-                Some(Ok(Message::Text(text))) if !query.readonly => handle_control(&shim, id, &text),
+                Some(Ok(Message::Text(text))) if !query.readonly => {
+                    let response = if let Some(client_id) = acknowledged_client.as_deref() {
+                        handle_acknowledged_control(&shim, id, client_id, &text)
+                    } else {
+                        handle_control(&shim, id, &text);
+                        None
+                    };
+                    if let Some(message) = response
+                        && reply_tx.send(message).await.is_err()
+                    {
+                        break;
+                    }
+                }
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
                 _ => {}
             }
         }
+    };
+    tokio::select! {
+        _ = send_output => {},
+        _ = receive_input => {},
     }
     release(&shim, id);
+}
+
+fn write_unacknowledged_input(shim: &Shim, id: u64, data: &[u8]) -> Option<String> {
+    let mut inner = shim.inner.lock().unwrap();
+    if inner.controller != Some(id) {
+        return Some(
+            serde_json::to_string(&json!({"type":"input_error","code":"ownership_lost"}))
+                .unwrap_or_default(),
+        );
+    }
+    let failed = inner
+        .input
+        .as_mut()
+        .is_none_or(|input| input.write_all(data).is_err());
+    failed.then(|| {
+        serde_json::to_string(&json!({"type":"input_error","code":"pty_write_failed"}))
+            .unwrap_or_default()
+    })
+}
+
+fn handle_acknowledged_control(
+    shim: &Shim,
+    id: u64,
+    client_id: &str,
+    text: &str,
+) -> Option<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Some(
+            serde_json::to_string(&json!({"type":"input_error","code":"invalid_control"}))
+                .unwrap_or_default(),
+        );
+    };
+    if value.get("type").and_then(|value| value.as_str()) != Some("input") {
+        handle_control_value(shim, id, &value);
+        return None;
+    }
+    let Some(sequence) = value.get("sequence").and_then(|value| value.as_u64()) else {
+        return Some(
+            serde_json::to_string(&json!({"type":"input_error","code":"invalid_sequence"}))
+                .unwrap_or_default(),
+        );
+    };
+    let Some(encoded) = value.get("data").and_then(|value| value.as_str()) else {
+        return Some(
+            serde_json::to_string(&json!({"type":"input_error","code":"invalid_input"}))
+                .unwrap_or_default(),
+        );
+    };
+    let Ok(data) = BASE64.decode(encoded) else {
+        return Some(
+            serde_json::to_string(&json!({"type":"input_error","code":"invalid_input"}))
+                .unwrap_or_default(),
+        );
+    };
+
+    let mut inner = shim.inner.lock().unwrap();
+    if inner.controller != Some(id) {
+        return Some(
+            serde_json::to_string(
+                &json!({"type":"input_rejected","code":"ownership_lost","sequence":sequence}),
+            )
+            .unwrap_or_default(),
+        );
+    }
+    let last_acknowledged = inner
+        .acknowledged_input
+        .get(client_id)
+        .copied()
+        .unwrap_or(0);
+    if sequence <= last_acknowledged {
+        return Some(input_ack(client_id, last_acknowledged));
+    }
+    if sequence != last_acknowledged + 1 {
+        return Some(serde_json::to_string(&json!({"type":"input_rejected","code":"sequence_gap","sequence":sequence,"expected":last_acknowledged + 1})).unwrap_or_default());
+    }
+    let failed = inner
+        .input
+        .as_mut()
+        .is_none_or(|input| input.write_all(&data).is_err());
+    if failed {
+        return Some(
+            serde_json::to_string(
+                &json!({"type":"input_error","code":"pty_write_failed","sequence":sequence}),
+            )
+            .unwrap_or_default(),
+        );
+    }
+    if !inner.acknowledged_input.contains_key(client_id) {
+        while inner.acknowledged_input.len() >= MAX_ACKNOWLEDGED_INPUT_CLIENTS {
+            if let Some(expired) = inner.acknowledged_input_order.pop_front() {
+                inner.acknowledged_input.remove(&expired);
+            }
+        }
+        inner
+            .acknowledged_input_order
+            .push_back(client_id.to_owned());
+    }
+    inner
+        .acknowledged_input
+        .insert(client_id.to_owned(), sequence);
+    Some(input_ack(client_id, sequence))
+}
+
+fn input_ack(client_id: &str, sequence: u64) -> String {
+    serde_json::to_string(&json!({"type":"input_ack","client_id":client_id,"sequence":sequence}))
+        .unwrap_or_default()
 }
 
 fn handle_control(shim: &Shim, id: u64, text: &str) {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
         return;
     };
+    handle_control_value(shim, id, &value);
+}
+
+fn handle_control_value(shim: &Shim, id: u64, value: &serde_json::Value) {
     let inner = shim.inner.lock().unwrap();
     if inner.controller != Some(id) {
         return;

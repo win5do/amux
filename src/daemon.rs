@@ -1405,11 +1405,25 @@ async fn proxy_attach(daemon: Daemon, process: Process, request: Request<Body>) 
 async fn bridge_ws(front: WebSocket, back: tokio_tungstenite::WebSocketStream<UnixStream>) {
     let (mut front_tx, mut front_rx) = front.split();
     let (mut back_tx, mut back_rx) = back.split();
-    loop {
-        tokio::select! {
-            message = front_rx.next() => match message { Some(Ok(v)) => if back_tx.send(to_tungstenite(v)).await.is_err() { break }, _ => break },
-            message = back_rx.next() => match message { Some(Ok(v)) => if let Some(v) = to_axum(v) && front_tx.send(v).await.is_err() { break }, _ => break },
+    let front_to_back = async {
+        while let Some(Ok(message)) = front_rx.next().await {
+            if back_tx.send(to_tungstenite(message)).await.is_err() {
+                break;
+            }
         }
+    };
+    let back_to_front = async {
+        while let Some(Ok(message)) = back_rx.next().await {
+            if let Some(message) = to_axum(message)
+                && front_tx.send(message).await.is_err()
+            {
+                break;
+            }
+        }
+    };
+    tokio::select! {
+        _ = front_to_back => {},
+        _ = back_to_front => {},
     }
 }
 

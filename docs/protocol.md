@@ -31,6 +31,15 @@ removal succeeds with `removed:false`.
 raw terminal bytes. JSON frames carry `resize`, `signal`, and `exit` messages.
 Query parameters are `readonly`, `takeover`, and `replay_bytes`.
 
+Clients that require reconnect-safe input may set `input_protocol=acked-v1`
+and a stable `input_client_id`. In this mode, input is sent as JSON
+`{"type":"input","sequence":N,"data":"<base64>"}` frames. The shim writes
+strictly increasing sequences once and responds with cumulative
+`{"type":"input_ack","client_id":"...","sequence":N}` acknowledgements.
+Repeating an acknowledged sequence is safe, so a client can resend every
+unacknowledged frame after reconnecting. Sequence gaps and lost controller
+ownership are explicitly rejected instead of silently discarding bytes.
+
 Daemon/shim tracing diagnostics are not part of the control protocol. They are
 written only to `amuxd.log` and workspace `shim.log`; they never appear in HTTP
 responses, CLI JSON, or process log NDJSON.
