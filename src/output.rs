@@ -52,9 +52,20 @@ struct GenerationReader {
 
 impl RecordReader {
     pub fn open(process_dir: &Path, after: u64, through: Option<u64>) -> Result<Self> {
+        Self::open_internal(process_dir, after, through, true)
+    }
+
+    fn open_internal(
+        process_dir: &Path,
+        after: u64,
+        through: Option<u64>,
+        report_gap: bool,
+    ) -> Result<Self> {
         let generations = open_generation_snapshot(process_dir)?;
         let oldest = generations.iter().find_map(|generation| generation.oldest);
-        let gap = oldest
+        let gap = report_gap
+            .then_some(oldest)
+            .flatten()
             .filter(|oldest| after.saturating_add(1) < *oldest)
             .map(|oldest_available| GapEvent {
                 kind: "gap",
@@ -321,6 +332,35 @@ impl OutputLog {
             file.read_exact(&mut bytes)?;
             for byte in bytes.into_iter().rev() {
                 output.push_front(byte);
+            }
+        }
+        Ok(output)
+    }
+
+    pub fn replay_event_tail(
+        &self,
+        stream: &str,
+        limit: usize,
+        through: u64,
+    ) -> Result<VecDeque<OutputEvent>> {
+        let mut output = VecDeque::new();
+        if limit == 0 {
+            return Ok(output);
+        }
+        let mut size = 0usize;
+        for record in RecordReader::open_internal(&self.process_dir, 0, Some(through), false)? {
+            let LogRecord::Output(event) = record? else {
+                continue;
+            };
+            if event.stream != stream {
+                continue;
+            }
+            size = size.saturating_add(event.length);
+            output.push_back(event);
+            while output.len() > 1 && size > limit {
+                if let Some(removed) = output.pop_front() {
+                    size = size.saturating_sub(removed.length);
+                }
             }
         }
         Ok(output)

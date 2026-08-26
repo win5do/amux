@@ -43,7 +43,9 @@ use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use crate::{
     logging::{LogConfig, install_process_log},
-    model::{Group, IoMode, Process, ProcessState, SignalRequest, StopRequest},
+    model::{
+        EncodedData, Group, IoMode, OutputEvent, Process, ProcessState, SignalRequest, StopRequest,
+    },
     observability::{self, ProcessRole},
     output::{OutputLog, OutputState, RecordReader},
     store::{atomic_json, read_json},
@@ -51,6 +53,7 @@ use crate::{
 
 const REPLAY_LIMIT: usize = 4 * 1024 * 1024;
 const ACKNOWLEDGED_INPUT_PROTOCOL: &str = "acked-v1";
+const SEQUENCED_OUTPUT_PROTOCOL: &str = "sequenced-v1";
 const MAX_ACKNOWLEDGED_INPUT_CLIENTS: usize = 64;
 
 struct Inner {
@@ -59,15 +62,21 @@ struct Inner {
     pty: Option<Box<dyn MasterPty + Send>>,
     output: OutputState,
     replay: VecDeque<u8>,
-    controller: Option<u64>,
+    controller: Option<Controller>,
     next_attach: u64,
     acknowledged_input: BTreeMap<String, u64>,
     acknowledged_input_order: VecDeque<String>,
 }
 
 #[derive(Clone)]
+struct Controller {
+    attach_id: u64,
+    client_id: Option<String>,
+}
+
+#[derive(Clone)]
 enum WireMessage {
-    Binary(Vec<u8>),
+    Binary { sequence: u64, data: Vec<u8> },
     Text(String),
 }
 
@@ -578,19 +587,25 @@ impl Shim {
     fn emit(&self, stream: &str, bytes: &[u8]) {
         let mut inner = self.inner.lock().unwrap();
         let execution = inner.process.execution;
-        if let Err(error) = self
+        let event = match self
             .output_log
             .append(&mut inner.output, stream, bytes, execution)
         {
-            error!(%error, process_id = %inner.process.id, execution, stream, "persist process output failed");
-            return;
-        }
+            Ok(event) => event,
+            Err(error) => {
+                error!(%error, process_id = %inner.process.id, execution, stream, "persist process output failed");
+                return;
+            }
+        };
         inner.replay.extend(bytes);
         while inner.replay.len() > REPLAY_LIMIT {
             inner.replay.pop_front();
         }
         drop(inner);
-        let _ = self.output.send(WireMessage::Binary(bytes.to_vec()));
+        let _ = self.output.send(WireMessage::Binary {
+            sequence: event.sequence,
+            data: bytes.to_vec(),
+        });
     }
 
     fn spawn_wait_pipe(&self, mut child: Child) {
@@ -762,7 +777,7 @@ async fn logs(State(shim): State<Shim>, Query(query): Query<LogsQuery>) -> Respo
                         break;
                     }
                 },
-                Ok(WireMessage::Binary(_)) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                Ok(WireMessage::Binary { .. }) | Err(broadcast::error::RecvError::Lagged(_)) => {
                     let latest = shim.inner.lock().unwrap().output.sequence;
                     if let Ok(records) = RecordReader::open(&shim.dir, cursor, Some(latest)) {
                         for record in records.flatten() {
@@ -790,6 +805,10 @@ struct AttachQuery {
     replay_bytes: usize,
     input_protocol: Option<String>,
     input_client_id: Option<String>,
+    control: Option<String>,
+    controller_client_id: Option<String>,
+    output_protocol: Option<String>,
+    after_output_sequence: Option<u64>,
 }
 fn default_replay() -> usize {
     8192
@@ -803,18 +822,22 @@ async fn attach(
     if shim.inner.lock().unwrap().process.io_mode != IoMode::Tty {
         return (StatusCode::CONFLICT, "process has no TTY").into_response();
     }
+    let valid_id = |value: &str| {
+        !value.is_empty()
+            && value.len() <= 128
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    };
     if query
         .input_protocol
         .as_deref()
         .is_some_and(|value| value != ACKNOWLEDGED_INPUT_PROTOCOL)
         || query.input_protocol.is_some() != query.input_client_id.is_some()
-        || query.input_client_id.as_deref().is_some_and(|value| {
-            value.is_empty()
-                || value.len() > 128
-                || !value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-        })
+        || query
+            .input_client_id
+            .as_deref()
+            .is_some_and(|value| !valid_id(value))
     {
         return (
             StatusCode::BAD_REQUEST,
@@ -822,42 +845,160 @@ async fn attach(
         )
             .into_response();
     }
-    let id = {
+    if query
+        .control
+        .as_deref()
+        .is_some_and(|value| value != "preferred")
+        || query.control.is_some() != query.controller_client_id.is_some()
+        || query
+            .controller_client_id
+            .as_deref()
+            .is_some_and(|value| !valid_id(value))
+        || (query.control.is_some() && (query.readonly || query.takeover))
+        || query
+            .output_protocol
+            .as_deref()
+            .is_some_and(|value| value != SEQUENCED_OUTPUT_PROTOCOL)
+        || (query.after_output_sequence.is_some()
+            && query.output_protocol.as_deref() != Some(SEQUENCED_OUTPUT_PROTOCOL))
+    {
+        return (StatusCode::BAD_REQUEST, "invalid terminal attach protocol").into_response();
+    }
+    let (id, owns_input) = {
         let mut inner = shim.inner.lock().unwrap();
         inner.next_attach += 1;
         let id = inner.next_attach;
-        if !query.readonly {
+        let owns_input = if query.control.as_deref() == Some("preferred") {
+            let preferred = query.controller_client_id.as_deref();
+            if inner
+                .controller
+                .as_ref()
+                .is_none_or(|controller| controller.client_id.as_deref() == preferred)
+            {
+                inner.controller = Some(Controller {
+                    attach_id: id,
+                    client_id: query.controller_client_id.clone(),
+                });
+                true
+            } else {
+                false
+            }
+        } else if query.readonly {
+            false
+        } else {
             if inner.controller.is_some() && !query.takeover {
                 return (StatusCode::CONFLICT, "controller already exists").into_response();
             }
             if inner.controller.is_some() && query.takeover {
                 info!(process_id = %inner.process.id, "TTY controller taken over");
             }
-            inner.controller = Some(id);
-        }
-        id
+            inner.controller = Some(Controller {
+                attach_id: id,
+                client_id: None,
+            });
+            true
+        };
+        (id, owns_input)
     };
-    ws.on_upgrade(move |socket| attach_socket(shim, socket, id, query))
+    ws.on_upgrade(move |socket| attach_socket(shim, socket, id, owns_input, query))
 }
 
-async fn attach_socket(shim: Shim, socket: WebSocket, id: u64, query: AttachQuery) {
+async fn attach_socket(
+    shim: Shim,
+    socket: WebSocket,
+    id: u64,
+    owns_input: bool,
+    query: AttachQuery,
+) {
     let (mut sink, mut source) = socket.split();
-    let replay = {
-        let inner = shim.inner.lock().unwrap();
-        inner
-            .replay
+    let mut output = shim.output.subscribe();
+    let boundary = shim.inner.lock().unwrap().output.sequence;
+    let sequenced = query.output_protocol.as_deref() == Some(SEQUENCED_OUTPUT_PROTOCOL);
+    let mut output_cursor = query.after_output_sequence.unwrap_or(0);
+    if sequenced {
+        let records = if query.after_output_sequence.is_some() {
+            collect_output_records(&shim, output_cursor, boundary)
+        } else {
+            shim.output_log
+                .replay_event_tail("tty", query.replay_bytes, boundary)
+                .map(|events| events.into_iter().map(OutputReplay::Event).collect())
+        };
+        let records = match records {
+            Ok(records) => records,
+            Err(_) => {
+                let _ = sink
+                    .send(Message::Text(
+                        json!({"type":"error","code":"output_replay_failed"})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await;
+                release(&shim, id);
+                return;
+            }
+        };
+        let start = records
             .iter()
-            .skip(inner.replay.len().saturating_sub(query.replay_bytes))
-            .copied()
-            .collect::<Vec<_>>()
-    };
-    if !replay.is_empty() && sink.send(Message::Binary(replay.into())).await.is_err() {
+            .find_map(|record| match record {
+                OutputReplay::Event(event) => Some(event.sequence.saturating_sub(1)),
+                OutputReplay::Gap {
+                    oldest_available, ..
+                } => Some(oldest_available.saturating_sub(1)),
+            })
+            .unwrap_or(boundary);
+        if sink
+            .send(Message::Text(
+                json!({"type":"output_cursor","sequence":start.to_string()})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .is_err()
+        {
+            release(&shim, id);
+            return;
+        }
+        output_cursor = start;
+        for record in records {
+            if send_output_replay(&mut sink, record, &mut output_cursor)
+                .await
+                .is_err()
+            {
+                release(&shim, id);
+                return;
+            }
+        }
+    } else {
+        let replay = {
+            let inner = shim.inner.lock().unwrap();
+            inner
+                .replay
+                .iter()
+                .skip(inner.replay.len().saturating_sub(query.replay_bytes))
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        if !replay.is_empty() && sink.send(Message::Binary(replay.into())).await.is_err() {
+            release(&shim, id);
+            return;
+        }
+    }
+    let (reply_tx, mut reply_rx) = mpsc::channel::<String>(64);
+    let ownership = if owns_input { "controller" } else { "readonly" };
+    if query.control.is_some()
+        && sink
+            .send(Message::Text(
+                json!({"type":"ownership_state","state":ownership})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .is_err()
+    {
         release(&shim, id);
         return;
     }
-    let mut output = shim.output.subscribe();
-    let (reply_tx, mut reply_rx) = mpsc::channel::<String>(64);
-    if !query.readonly {
+    if owns_input && query.control.is_none() {
         let notice = serde_json::to_string(
             &json!({"type":"ownership_changed","controller":id,"takeover":query.takeover}),
         )
@@ -880,11 +1021,37 @@ async fn attach_socket(shim: Shim, socket: WebSocket, id: u64, query: AttachQuer
     }
     let acknowledged_client = query.input_client_id.clone();
     let send_output = async {
+        let mut cursor = output_cursor;
         loop {
             tokio::select! {
                 received = output.recv() => match received {
-                    Ok(WireMessage::Binary(data)) => if sink.send(Message::Binary(data.into())).await.is_err() { break; },
+                    Ok(WireMessage::Binary { sequence, data }) => {
+                        if sequenced {
+                            if sequence <= cursor { continue; }
+                            if sequence > cursor.saturating_add(1) {
+                                let records = collect_output_records(&shim, cursor, sequence);
+                                let Ok(records) = records else {
+                                    let _ = sink.send(Message::Text(json!({"type":"error","code":"output_replay_failed"}).to_string().into())).await;
+                                    break;
+                                };
+                                for record in records {
+                                    if send_output_replay(&mut sink, record, &mut cursor).await.is_err() { return; }
+                                }
+                            } else if sink.send(Message::Binary(sequenced_frame(sequence, &data).into())).await.is_err() { break; }
+                            cursor = cursor.max(sequence);
+                        } else if sink.send(Message::Binary(data.into())).await.is_err() { break; }
+                    },
                     Ok(WireMessage::Text(text)) => if sink.send(Message::Text(text.into())).await.is_err() { break; },
+                    Err(broadcast::error::RecvError::Lagged(_)) if sequenced => {
+                        let latest = shim.inner.lock().unwrap().output.sequence;
+                        let Ok(records) = collect_output_records(&shim, cursor, latest) else {
+                            let _ = sink.send(Message::Text(json!({"type":"error","code":"output_replay_failed"}).to_string().into())).await;
+                            break;
+                        };
+                        for record in records {
+                            if send_output_replay(&mut sink, record, &mut cursor).await.is_err() { return; }
+                        }
+                    },
                     Err(_) => break,
                 },
                 reply = reply_rx.recv() => match reply {
@@ -897,16 +1064,14 @@ async fn attach_socket(shim: Shim, socket: WebSocket, id: u64, query: AttachQuer
     let receive_input = async {
         loop {
             match futures_util::StreamExt::next(&mut source).await {
-                Some(Ok(Message::Binary(data)))
-                    if !query.readonly && acknowledged_client.is_none() =>
-                {
+                Some(Ok(Message::Binary(data))) if owns_input && acknowledged_client.is_none() => {
                     let result = write_unacknowledged_input(&shim, id, &data);
                     if let Some(message) = result {
                         let _ = reply_tx.send(message).await;
                         break;
                     }
                 }
-                Some(Ok(Message::Text(text))) if !query.readonly => {
+                Some(Ok(Message::Text(text))) if owns_input => {
                     let response = if let Some(client_id) = acknowledged_client.as_deref() {
                         handle_acknowledged_control(&shim, id, client_id, &text)
                     } else {
@@ -915,6 +1080,20 @@ async fn attach_socket(shim: Shim, socket: WebSocket, id: u64, query: AttachQuer
                     };
                     if let Some(message) = response
                         && reply_tx.send(message).await.is_err()
+                    {
+                        break;
+                    }
+                }
+                Some(Ok(Message::Binary(_))) | Some(Ok(Message::Text(_))) if !owns_input => {
+                    if reply_tx
+                        .send(
+                            serde_json::to_string(
+                                &json!({"type":"input_rejected","code":"read_only"}),
+                            )
+                            .unwrap_or_default(),
+                        )
+                        .await
+                        .is_err()
                     {
                         break;
                     }
@@ -933,7 +1112,7 @@ async fn attach_socket(shim: Shim, socket: WebSocket, id: u64, query: AttachQuer
 
 fn write_unacknowledged_input(shim: &Shim, id: u64, data: &[u8]) -> Option<String> {
     let mut inner = shim.inner.lock().unwrap();
-    if inner.controller != Some(id) {
+    if inner.controller.as_ref().map(|value| value.attach_id) != Some(id) {
         return Some(
             serde_json::to_string(&json!({"type":"input_error","code":"ownership_lost"}))
                 .unwrap_or_default(),
@@ -985,7 +1164,7 @@ fn handle_acknowledged_control(
     };
 
     let mut inner = shim.inner.lock().unwrap();
-    if inner.controller != Some(id) {
+    if inner.controller.as_ref().map(|value| value.attach_id) != Some(id) {
         return Some(
             serde_json::to_string(
                 &json!({"type":"input_rejected","code":"ownership_lost","sequence":sequence}),
@@ -1046,7 +1225,7 @@ fn handle_control(shim: &Shim, id: u64, text: &str) {
 
 fn handle_control_value(shim: &Shim, id: u64, value: &serde_json::Value) {
     let inner = shim.inner.lock().unwrap();
-    if inner.controller != Some(id) {
+    if inner.controller.as_ref().map(|value| value.attach_id) != Some(id) {
         return;
     }
     match value.get("type").and_then(|v| v.as_str()) {
@@ -1075,9 +1254,86 @@ fn handle_control_value(shim: &Shim, id: u64, value: &serde_json::Value) {
 
 fn release(shim: &Shim, id: u64) {
     let mut inner = shim.inner.lock().unwrap();
-    if inner.controller == Some(id) {
+    if inner.controller.as_ref().map(|value| value.attach_id) == Some(id) {
         inner.controller = None;
     }
+}
+
+enum OutputReplay {
+    Gap {
+        requested_after: u64,
+        oldest_available: u64,
+    },
+    Event(OutputEvent),
+}
+
+fn collect_output_records(shim: &Shim, after: u64, through: u64) -> Result<Vec<OutputReplay>> {
+    RecordReader::open(&shim.dir, after, Some(through))?
+        .map(|record| match record? {
+            crate::output::LogRecord::Gap(gap) => Ok(OutputReplay::Gap {
+                requested_after: gap.requested_after,
+                oldest_available: gap.oldest_available,
+            }),
+            crate::output::LogRecord::Output(event) if event.stream == "tty" => {
+                Ok(OutputReplay::Event(event))
+            }
+            crate::output::LogRecord::Output(_) => {
+                Err(anyhow::anyhow!("unexpected non-TTY output"))
+            }
+        })
+        .collect()
+}
+
+async fn send_output_replay(
+    sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    record: OutputReplay,
+    cursor: &mut u64,
+) -> Result<(), ()> {
+    match record {
+        OutputReplay::Gap {
+            requested_after,
+            oldest_available,
+        } => {
+            sink.send(Message::Text(
+                json!({
+                    "type":"output_gap",
+                    "requested_after":requested_after.to_string(),
+                    "oldest_available":oldest_available.to_string()
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .map_err(|_| ())?;
+            *cursor = oldest_available.saturating_sub(1);
+        }
+        OutputReplay::Event(event) => {
+            let data = output_data(event.data.as_ref()).ok_or(())?;
+            sink.send(Message::Binary(
+                sequenced_frame(event.sequence, &data).into(),
+            ))
+            .await
+            .map_err(|_| ())?;
+            *cursor = (*cursor).max(event.sequence);
+        }
+    }
+    Ok(())
+}
+
+fn output_data(data: Option<&EncodedData>) -> Option<Vec<u8>> {
+    let data = data?;
+    match data.encoding.as_str() {
+        "utf8" => Some(data.text.as_bytes().to_vec()),
+        "base64" => BASE64.decode(&data.base64).ok(),
+        _ => None,
+    }
+}
+
+fn sequenced_frame(sequence: u64, data: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(8 + data.len());
+    frame.extend_from_slice(&sequence.to_be_bytes());
+    frame.extend_from_slice(data);
+    frame
 }
 
 async fn shutdown(State(shim): State<Shim>) -> Response {
