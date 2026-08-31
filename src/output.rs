@@ -1,16 +1,16 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     ffi::CString,
-    fs::{self, File},
-    io::{BufRead, BufReader, Lines, Read, Seek, SeekFrom},
+    fs::{self, File, OpenOptions},
+    io::{BufRead, BufReader, Lines, Read, Seek, SeekFrom, Write},
     os::{
         fd::{AsRawFd, FromRawFd},
-        unix::fs::MetadataExt,
+        unix::fs::{MetadataExt, OpenOptionsExt},
     },
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use base64::Engine;
 use chrono::Utc;
 use serde::Serialize;
@@ -19,7 +19,6 @@ use tracing::{debug, warn};
 use crate::{
     logging::LogConfig,
     model::{EncodedData, OutputEvent},
-    store::{append_line, append_raw},
 };
 
 pub const LIVE_EVENT_LIMIT: usize = 4096;
@@ -247,6 +246,69 @@ pub struct OutputState {
     pub recent: VecDeque<OutputEvent>,
 }
 
+pub struct OutputFiles {
+    current_dir: PathBuf,
+    streams: BTreeMap<String, File>,
+    index: File,
+    dirty: bool,
+}
+
+impl OutputFiles {
+    fn open(current_dir: PathBuf) -> Result<Self> {
+        fs::create_dir_all(&current_dir)?;
+        let index = open_append(&current_dir.join("events.jsonl"))?;
+        Ok(Self {
+            current_dir,
+            streams: BTreeMap::new(),
+            index,
+            dirty: false,
+        })
+    }
+
+    fn append(&mut self, stream: &str, offset: i64, bytes: &[u8], line: &[u8]) -> Result<()> {
+        let path = self.current_dir.join(format!("{stream}.log"));
+        let raw = match self.streams.entry(stream.to_owned()) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => entry.insert(open_append(&path)?),
+        };
+        let raw_start = raw.metadata()?.len();
+        if offset < 0 || raw_start != offset as u64 {
+            bail!(
+                "output stream offset mismatch for {stream}: expected {offset}, found {raw_start}"
+            );
+        }
+        let index_start = self.index.metadata()?.len();
+        if let Err(error) = raw
+            .write_all(bytes)
+            .and_then(|_| self.index.write_all(line))
+            .and_then(|_| self.index.write_all(b"\n"))
+        {
+            let _ = raw.set_len(raw_start);
+            let _ = self.index.set_len(index_start);
+            return Err(error.into());
+        }
+        self.dirty = true;
+        Ok(())
+    }
+
+    pub fn sync_data(&mut self) -> Result<bool> {
+        if !self.dirty {
+            return Ok(false);
+        }
+        for file in self.streams.values() {
+            file.sync_data()?;
+        }
+        self.index.sync_data()?;
+        self.dirty = false;
+        Ok(true)
+    }
+
+    fn reopen(&mut self, current_dir: PathBuf) -> Result<()> {
+        *self = Self::open(current_dir)?;
+        Ok(())
+    }
+}
+
 impl OutputState {
     fn remember(&mut self, event: OutputEvent) {
         self.recent.push_back(event);
@@ -257,20 +319,26 @@ impl OutputState {
 }
 
 impl OutputLog {
-    pub fn open(process_dir: impl Into<PathBuf>, config: LogConfig) -> Result<(Self, OutputState)> {
+    pub fn open(
+        process_dir: impl Into<PathBuf>,
+        config: LogConfig,
+    ) -> Result<(Self, OutputState, OutputFiles)> {
         let this = Self {
             process_dir: process_dir.into(),
             config,
         };
         this.migrate_legacy()?;
         fs::create_dir_all(this.current_dir())?;
+        this.repair_current_generation()?;
         let state = this.scan_state()?;
-        Ok((this, state))
+        let files = OutputFiles::open(this.current_dir())?;
+        Ok((this, state, files))
     }
 
     pub fn append(
         &self,
         state: &mut OutputState,
+        files: &mut OutputFiles,
         stream: &str,
         bytes: &[u8],
         execution: u64,
@@ -290,16 +358,16 @@ impl OutputLog {
         if state.active_size > 0
             && state.active_size.saturating_add(addition) > self.config.rotate_size
         {
+            files.sync_data()?;
             self.rotate()?;
+            files.reopen(self.current_dir())?;
             state.offsets.clear();
             state.active_size = 0;
             offset = 0;
             event.offset = 0;
             line = serde_json::to_vec(&event)?;
         }
-        let current = self.current_dir();
-        append_raw(&current.join(format!("{stream}.log")), bytes)?;
-        append_line(&current.join("events.jsonl"), &line)?;
+        files.append(stream, offset, bytes, &line)?;
         state.sequence = event.sequence;
         state
             .offsets
@@ -368,6 +436,66 @@ impl OutputLog {
 
     fn current_dir(&self) -> PathBuf {
         self.process_dir.join("output/current")
+    }
+
+    fn repair_current_generation(&self) -> Result<()> {
+        let current = self.current_dir();
+        fs::create_dir_all(&current)?;
+        let index_path = current.join("events.jsonl");
+        let index = fs::read(&index_path).unwrap_or_default();
+        let mut valid_index_len = 0usize;
+        let mut expected_offsets = BTreeMap::<String, u64>::new();
+        let mut previous_sequence = None;
+
+        for encoded_line in index.split_inclusive(|byte| *byte == b'\n') {
+            if encoded_line.last() != Some(&b'\n') {
+                break;
+            }
+            let Ok(event) = serde_json::from_slice::<OutputEvent>(
+                &encoded_line[..encoded_line.len().saturating_sub(1)],
+            ) else {
+                break;
+            };
+            if !matches!(event.stream.as_str(), "stdout" | "stderr" | "tty")
+                || event.offset < 0
+                || previous_sequence.is_some_and(|sequence| event.sequence != sequence + 1)
+            {
+                break;
+            }
+            let expected = *expected_offsets.get(&event.stream).unwrap_or(&0);
+            let Some(end) = (event.offset as u64).checked_add(event.length as u64) else {
+                break;
+            };
+            let raw_length = fs::metadata(current.join(format!("{}.log", event.stream)))
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            if event.offset as u64 != expected || end > raw_length {
+                break;
+            }
+            expected_offsets.insert(event.stream.clone(), end);
+            previous_sequence = Some(event.sequence);
+            valid_index_len += encoded_line.len();
+        }
+
+        let mut repaired = valid_index_len != index.len();
+        if repaired {
+            open_append(&index_path)?.set_len(valid_index_len as u64)?;
+        }
+        for stream in ["stdout", "stderr", "tty"] {
+            let path = current.join(format!("{stream}.log"));
+            let Ok(metadata) = fs::metadata(&path) else {
+                continue;
+            };
+            let expected = *expected_offsets.get(stream).unwrap_or(&0);
+            if metadata.len() > expected {
+                open_append(&path)?.set_len(expected)?;
+                repaired = true;
+            }
+        }
+        if repaired {
+            warn!(process_dir = %self.process_dir.display(), "repaired incomplete output generation tail");
+        }
+        Ok(())
     }
 
     fn scan_state(&self) -> Result<OutputState> {
@@ -465,6 +593,14 @@ impl OutputLog {
         fs::create_dir_all(self.current_dir())?;
         Ok(())
     }
+}
+
+fn open_append(path: &Path) -> Result<File> {
+    Ok(OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)?)
 }
 
 pub fn visit_records(
@@ -585,11 +721,12 @@ fn directory_file_size(dir: &Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::{append_line, append_raw};
 
     #[test]
     fn rotates_generations_and_reports_gap() {
         let temp = tempfile::tempdir().unwrap();
-        let (log, mut state) = OutputLog::open(
+        let (log, mut state, mut files) = OutputLog::open(
             temp.path(),
             LogConfig {
                 rotate_size: 220,
@@ -598,7 +735,8 @@ mod tests {
         )
         .unwrap();
         for _ in 0..8 {
-            log.append(&mut state, "stdout", b"abcdefghij", 1).unwrap();
+            log.append(&mut state, &mut files, "stdout", b"abcdefghij", 1)
+                .unwrap();
         }
         let backups = fs::read_dir(temp.path().join("output"))
             .unwrap()
@@ -638,7 +776,7 @@ mod tests {
             &serde_json::to_vec(&event).unwrap(),
         )
         .unwrap();
-        let (_, state) = OutputLog::open(
+        let (_, state, _) = OutputLog::open(
             temp.path(),
             LogConfig {
                 rotate_size: 1024,
@@ -671,5 +809,121 @@ mod tests {
         }
         assert_eq!(state.recent.len(), LIVE_EVENT_LIMIT);
         assert_eq!(state.recent.front().unwrap().sequence, 33);
+    }
+
+    #[test]
+    fn appends_are_readable_before_batched_sync() {
+        let temp = tempfile::tempdir().unwrap();
+        let (log, mut state, mut files) = OutputLog::open(
+            temp.path(),
+            LogConfig {
+                rotate_size: 1024,
+                backup_count: 2,
+            },
+        )
+        .unwrap();
+        log.append(&mut state, &mut files, "tty", b"a", 1).unwrap();
+        log.append(&mut state, &mut files, "tty", b"b", 1).unwrap();
+
+        assert!(files.dirty);
+        assert_eq!(fs::read(log.current_dir().join("tty.log")).unwrap(), b"ab");
+        let records = RecordReader::open(temp.path(), 0, None)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(files.sync_data().unwrap());
+        assert!(!files.sync_data().unwrap());
+    }
+
+    #[test]
+    fn repairs_incomplete_index_and_orphan_raw_tail() {
+        let temp = tempfile::tempdir().unwrap();
+        let current = temp.path().join("output/current");
+        fs::create_dir_all(&current).unwrap();
+        fs::write(current.join("tty.log"), b"ok-orphan").unwrap();
+        let event = OutputEvent {
+            sequence: 7,
+            execution: 1,
+            timestamp: Utc::now(),
+            stream: "tty".into(),
+            offset: 0,
+            length: 2,
+            data: None,
+        };
+        let mut index = serde_json::to_vec(&event).unwrap();
+        index.push(b'\n');
+        index.extend_from_slice(b"{\"sequence\":8");
+        fs::write(current.join("events.jsonl"), &index).unwrap();
+
+        let (_, state, _) = OutputLog::open(
+            temp.path(),
+            LogConfig {
+                rotate_size: 1024,
+                backup_count: 2,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(state.sequence, 7);
+        assert_eq!(fs::read(current.join("tty.log")).unwrap(), b"ok");
+        assert_eq!(
+            fs::read(current.join("events.jsonl")).unwrap(),
+            serde_json::to_vec(&event)
+                .unwrap()
+                .into_iter()
+                .chain([b'\n'])
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn repairs_index_event_that_extends_past_raw_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let current = temp.path().join("output/current");
+        fs::create_dir_all(&current).unwrap();
+        fs::write(current.join("stdout.log"), b"ok").unwrap();
+        let valid = OutputEvent {
+            sequence: 4,
+            execution: 1,
+            timestamp: Utc::now(),
+            stream: "stdout".into(),
+            offset: 0,
+            length: 2,
+            data: None,
+        };
+        let invalid = OutputEvent {
+            sequence: 5,
+            execution: 1,
+            timestamp: Utc::now(),
+            stream: "stdout".into(),
+            offset: 2,
+            length: 1,
+            data: None,
+        };
+        let mut index = serde_json::to_vec(&valid).unwrap();
+        index.push(b'\n');
+        index.extend(serde_json::to_vec(&invalid).unwrap());
+        index.push(b'\n');
+        fs::write(current.join("events.jsonl"), index).unwrap();
+
+        let (_, state, _) = OutputLog::open(
+            temp.path(),
+            LogConfig {
+                rotate_size: 1024,
+                backup_count: 2,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(state.sequence, 4);
+        assert_eq!(
+            fs::read(current.join("events.jsonl")).unwrap(),
+            serde_json::to_vec(&valid)
+                .unwrap()
+                .into_iter()
+                .chain([b'\n'])
+                .collect::<Vec<_>>()
+        );
     }
 }

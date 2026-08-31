@@ -47,7 +47,7 @@ use crate::{
         EncodedData, Group, IoMode, OutputEvent, Process, ProcessState, SignalRequest, StopRequest,
     },
     observability::{self, ProcessRole},
-    output::{OutputLog, OutputState, RecordReader},
+    output::{OutputFiles, OutputLog, OutputState, RecordReader},
     store::{atomic_json, read_json},
 };
 
@@ -55,17 +55,23 @@ const REPLAY_LIMIT: usize = 4 * 1024 * 1024;
 const ACKNOWLEDGED_INPUT_PROTOCOL: &str = "acked-v1";
 const SEQUENCED_OUTPUT_PROTOCOL: &str = "sequenced-v1";
 const MAX_ACKNOWLEDGED_INPUT_CLIENTS: usize = 64;
+const OUTPUT_SYNC_INTERVAL: Duration = Duration::from_millis(25);
 
 struct Inner {
     process: Process,
     input: Option<Box<dyn Write + Send>>,
     pty: Option<Box<dyn MasterPty + Send>>,
-    output: OutputState,
-    replay: VecDeque<u8>,
     controller: Option<Controller>,
     next_attach: u64,
     acknowledged_input: BTreeMap<String, u64>,
     acknowledged_input_order: VecDeque<String>,
+}
+
+struct OutputRuntime {
+    state: OutputState,
+    files: OutputFiles,
+    replay: VecDeque<u8>,
+    sync_error_reported: bool,
 }
 
 #[derive(Clone)]
@@ -86,6 +92,7 @@ pub struct Shim {
     socket: PathBuf,
     output_log: OutputLog,
     inner: Arc<Mutex<Inner>>,
+    output_runtime: Arc<Mutex<OutputRuntime>>,
     output: broadcast::Sender<WireMessage>,
     lifecycle: broadcast::Sender<Process>,
     readers: Arc<(Mutex<usize>, Condvar)>,
@@ -392,9 +399,16 @@ impl Shim {
         let dir = dir.into();
         let socket = socket.into();
         let process: Process = read_json(dir.join("metadata.json"))?;
-        let (output_log, output_state) = OutputLog::open(&dir, log_config)?;
+        let (output_log, output_state, output_files) = OutputLog::open(&dir, log_config)?;
         let replay = output_log.replay_tail("tty", REPLAY_LIMIT)?;
         let (output, _) = broadcast::channel(256);
+        let output_runtime = Arc::new(Mutex::new(OutputRuntime {
+            state: output_state,
+            files: output_files,
+            replay,
+            sync_error_reported: false,
+        }));
+        spawn_output_sync(&output_runtime, process.id.clone());
         Ok(Self {
             dir,
             socket,
@@ -403,13 +417,12 @@ impl Shim {
                 process,
                 input: None,
                 pty: None,
-                output: output_state,
-                replay,
                 controller: None,
                 next_attach: 0,
                 acknowledged_input: BTreeMap::new(),
                 acknowledged_input_order: VecDeque::new(),
             })),
+            output_runtime,
             output,
             lifecycle,
             readers: Arc::new((Mutex::new(0), Condvar::new())),
@@ -585,23 +598,27 @@ impl Shim {
     }
 
     fn emit(&self, stream: &str, bytes: &[u8]) {
-        let mut inner = self.inner.lock().unwrap();
-        let execution = inner.process.execution;
-        let event = match self
-            .output_log
-            .append(&mut inner.output, stream, bytes, execution)
-        {
+        let (execution, process_id) = {
+            let inner = self.inner.lock().unwrap();
+            (inner.process.execution, inner.process.id.clone())
+        };
+        let mut output = self.output_runtime.lock().unwrap();
+        let event = match {
+            let OutputRuntime { state, files, .. } = &mut *output;
+            self.output_log
+                .append(state, files, stream, bytes, execution)
+        } {
             Ok(event) => event,
             Err(error) => {
-                error!(%error, process_id = %inner.process.id, execution, stream, "persist process output failed");
+                error!(%error, process_id = %process_id, execution, stream, "persist process output failed");
                 return;
             }
         };
-        inner.replay.extend(bytes);
-        while inner.replay.len() > REPLAY_LIMIT {
-            inner.replay.pop_front();
+        output.replay.extend(bytes);
+        while output.replay.len() > REPLAY_LIMIT {
+            output.replay.pop_front();
         }
-        drop(inner);
+        drop(output);
         let _ = self.output.send(WireMessage::Binary {
             sequence: event.sequence,
             data: bytes.to_vec(),
@@ -634,6 +651,7 @@ impl Shim {
             count = ready.wait(count).unwrap();
         }
         drop(count);
+        self.sync_output();
         let (process, message) = {
             let mut inner = self.inner.lock().unwrap();
             inner.process.exit_code = Some(code.unwrap_or(-1));
@@ -653,6 +671,7 @@ impl Shim {
     }
 
     fn fail_wait(&self, error: impl std::fmt::Display) {
+        self.sync_output();
         let process = {
             let mut inner = self.inner.lock().unwrap();
             inner.process.state = ProcessState::Failed;
@@ -671,6 +690,40 @@ impl Shim {
                 .unwrap_or_default(),
         ));
     }
+
+    fn sync_output(&self) {
+        let process_id = self.inner.lock().unwrap().process.id.clone();
+        let mut output = self.output_runtime.lock().unwrap();
+        match output.files.sync_data() {
+            Ok(_) => output.sync_error_reported = false,
+            Err(error) if !output.sync_error_reported => {
+                output.sync_error_reported = true;
+                error!(%error, process_id = %process_id, "sync process output failed");
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+fn spawn_output_sync(output_runtime: &Arc<Mutex<OutputRuntime>>, process_id: String) {
+    let output_runtime = Arc::downgrade(output_runtime);
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(OUTPUT_SYNC_INTERVAL);
+            let Some(output_runtime) = output_runtime.upgrade() else {
+                break;
+            };
+            let mut output = output_runtime.lock().unwrap();
+            match output.files.sync_data() {
+                Ok(_) => output.sync_error_reported = false,
+                Err(error) if !output.sync_error_reported => {
+                    output.sync_error_reported = true;
+                    error!(%error, process_id = %process_id, "sync process output failed");
+                }
+                Err(_) => {}
+            }
+        }
+    });
 }
 
 async fn status(State(shim): State<Shim>) -> Json<Process> {
@@ -734,7 +787,7 @@ struct LogsQuery {
 
 async fn logs(State(shim): State<Shim>, Query(query): Query<LogsQuery>) -> Response {
     if !query.follow {
-        let boundary = shim.inner.lock().unwrap().output.sequence;
+        let boundary = shim.output_runtime.lock().unwrap().state.sequence;
         let dir = shim.dir.clone();
         let stream = async_stream::stream! {
             if let Ok(records) = RecordReader::open(&dir, query.after, Some(boundary)) {
@@ -748,7 +801,7 @@ async fn logs(State(shim): State<Shim>, Query(query): Query<LogsQuery>) -> Respo
         return Body::from_stream(stream).into_response();
     }
     let mut receiver = shim.output.subscribe();
-    let boundary = shim.inner.lock().unwrap().output.sequence;
+    let boundary = shim.output_runtime.lock().unwrap().state.sequence;
     let stream = async_stream::stream! {
         if let Ok(records) = RecordReader::open(&shim.dir, query.after, Some(boundary)) {
             for record in records.flatten() {
@@ -766,7 +819,7 @@ async fn logs(State(shim): State<Shim>, Query(query): Query<LogsQuery>) -> Respo
                         .and_then(|value| value.get("type").and_then(|kind| kind.as_str()).map(str::to_owned))
                         .as_deref() == Some("exit")
                     {
-                        let latest = shim.inner.lock().unwrap().output.sequence;
+                        let latest = shim.output_runtime.lock().unwrap().state.sequence;
                         if let Ok(records) = RecordReader::open(&shim.dir, cursor, Some(latest)) {
                             for record in records.flatten() {
                                 if let Ok(line) = record.to_json_line() {
@@ -778,7 +831,7 @@ async fn logs(State(shim): State<Shim>, Query(query): Query<LogsQuery>) -> Respo
                     }
                 },
                 Ok(WireMessage::Binary { .. }) | Err(broadcast::error::RecvError::Lagged(_)) => {
-                    let latest = shim.inner.lock().unwrap().output.sequence;
+                    let latest = shim.output_runtime.lock().unwrap().state.sequence;
                     if let Ok(records) = RecordReader::open(&shim.dir, cursor, Some(latest)) {
                         for record in records.flatten() {
                             if let Ok(line) = record.to_json_line() {
@@ -912,7 +965,7 @@ async fn attach_socket(
 ) {
     let (mut sink, mut source) = socket.split();
     let mut output = shim.output.subscribe();
-    let boundary = shim.inner.lock().unwrap().output.sequence;
+    let boundary = shim.output_runtime.lock().unwrap().state.sequence;
     let sequenced = query.output_protocol.as_deref() == Some(SEQUENCED_OUTPUT_PROTOCOL);
     let mut output_cursor = query.after_output_sequence.unwrap_or(0);
     if sequenced {
@@ -970,11 +1023,11 @@ async fn attach_socket(
         }
     } else {
         let replay = {
-            let inner = shim.inner.lock().unwrap();
-            inner
+            let output = shim.output_runtime.lock().unwrap();
+            output
                 .replay
                 .iter()
-                .skip(inner.replay.len().saturating_sub(query.replay_bytes))
+                .skip(output.replay.len().saturating_sub(query.replay_bytes))
                 .copied()
                 .collect::<Vec<_>>()
         };
@@ -1043,7 +1096,7 @@ async fn attach_socket(
                     },
                     Ok(WireMessage::Text(text)) => if sink.send(Message::Text(text.into())).await.is_err() { break; },
                     Err(broadcast::error::RecvError::Lagged(_)) if sequenced => {
-                        let latest = shim.inner.lock().unwrap().output.sequence;
+                        let latest = shim.output_runtime.lock().unwrap().state.sequence;
                         let Ok(records) = collect_output_records(&shim, cursor, latest) else {
                             let _ = sink.send(Message::Text(json!({"type":"error","code":"output_replay_failed"}).to_string().into())).await;
                             break;

@@ -15,11 +15,14 @@ implementation. Durable files live below `AMUX_STATE_DIR`; short shim socket
 paths live below `/tmp/amux-UID/shims` to fit macOS `sockaddr_un` limits.
 
 Each output stream has one authoritative reader. The shim appends bytes to the
-raw stream log, syncs it, appends a monotonically sequenced event to
-`events.jsonl`, then broadcasts it. Raw streams and their event index are
-rotated together as a generation under `output/`: `current/` is active and UTC
-timestamped `*.bak/` directories are retained history. Sequence numbers remain
-monotonic across generations and process restarts. Legacy process-root log
+raw stream log, appends a monotonically sequenced event to `events.jsonl`, then
+broadcasts it. Dirty raw streams and their event index are synced in that order
+on a 25 ms cadence, and synchronously at process exit and rotation. A system
+crash can therefore lose at most the active sync batch; startup repairs an
+incomplete current-generation tail before replay. Raw streams and their event
+index are rotated together as a generation under `output/`: `current/` is active
+and UTC timestamped `*.bak/` directories are retained history. Sequence numbers
+remain monotonic across generations and process restarts. Legacy process-root log
 files remain readable and are migrated when a shim next starts without a schema
 reset. A TTY has one writable controller and any number of readonly observers.
 `--takeover` replaces the controller.
