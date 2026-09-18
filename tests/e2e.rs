@@ -227,6 +227,94 @@ async fn pipe_lifecycle_and_daemon_recovery() {
 }
 
 #[tokio::test]
+async fn inherited_tty_default_accepts_ctrl_c_and_allows_pipe_override() {
+    let _guard = E2E_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let socket = temp.path().join("amux.sock");
+    struct RuntimeGuard {
+        child: Child,
+    }
+    impl Drop for RuntimeGuard {
+        fn drop(&mut self) {
+            // This fixture uses an explicit socket, not a named daemon registration.
+            unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
+            let _ = self.child.wait();
+        }
+    }
+    let _runtime = RuntimeGuard {
+        child: daemon(&state, &socket),
+    };
+    ok(&state, &socket, &["workspace", "create", "dev"]);
+    let launch = |name: &str, mode: Option<&str>, script: &str| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_amux"));
+        command
+            .env("AMUX_STATE_DIR", &state)
+            .env("AMUX_SOCKET", &socket)
+            .env("AMUX_WORKSPACE", "dev")
+            .env("AMUX_IO_MODE", "tty")
+            .args(["--json", "run", "--name", name]);
+        if let Some(mode) = mode {
+            command.args(["--io-mode", mode]);
+        }
+        let output = command
+            .args(["--", "/bin/sh", "-c", script])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let process = launch(
+        "interactive",
+        None,
+        "test -t 0 && test -t 1 || exit 9; trap 'exit 42' INT; printf READY; while :; do read value; done",
+    );
+    assert_eq!(process["process"]["io_mode"], "tty");
+    let client = Client::new(Config {
+        state_dir: state.clone(),
+        socket: socket.clone(),
+    });
+    let mut terminal = client
+        .attach("/v1/processes/dev/interactive/attach?replay_bytes=8192")
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut output = Vec::new();
+        while let Some(message) = terminal.next().await {
+            if let Message::Binary(bytes) = message.unwrap() {
+                output.extend_from_slice(&bytes);
+                if output.windows(5).any(|bytes| bytes == b"READY") {
+                    return;
+                }
+            }
+        }
+        panic!("TTY closed before the command was ready");
+    })
+    .await
+    .unwrap();
+    terminal
+        .send(Message::Binary(vec![3].into()))
+        .await
+        .unwrap();
+    let exit = next_text(&mut terminal, "exit").await;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&exit).unwrap()["exit_code"],
+        42,
+        "Ctrl+C must reach the command's SIGINT trap"
+    );
+    terminal.close(None).await.ok();
+
+    let process = launch("piped", Some("pipe"), "test ! -t 0 && test ! -t 1");
+    assert_eq!(process["process"]["io_mode"], "pipe");
+    let waited = ok(&state, &socket, &["--json", "wait", "dev/piped"]);
+    assert!(waited.contains("\"exit_code\":0"));
+}
+
+#[tokio::test]
 async fn tty_attach_and_controller_ownership() {
     let _guard = E2E_LOCK.lock().await;
     let temp = tempfile::tempdir().unwrap();

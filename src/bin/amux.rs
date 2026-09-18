@@ -165,6 +165,9 @@ struct RunArgs {
     runtime: String,
     #[arg(short = 't', long)]
     tty: bool,
+    /// I/O mode for commands; --tty overrides this default.
+    #[arg(long, env = "AMUX_IO_MODE", default_value = "pipe", value_parser = parse_io_mode)]
+    io_mode: IoMode,
     #[arg(long, default_value_t = 40)]
     rows: u16,
     #[arg(long, default_value_t = 120)]
@@ -265,7 +268,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 command: args.command,
                 cwd: args.cwd,
                 env: args.env.into_iter().collect(),
-                io_mode: if args.tty { IoMode::Tty } else { IoMode::Pipe },
+                io_mode: if args.tty { IoMode::Tty } else { args.io_mode },
                 runtime: args.runtime,
                 initial_rows: args.rows,
                 initial_cols: args.cols,
@@ -806,6 +809,13 @@ fn parse_env(value: &str) -> Result<(String, String), String> {
         .split_once('=')
         .map(|(k, v)| (k.into(), v.into()))
         .ok_or_else(|| "environment must be KEY=VALUE".into())
+}
+fn parse_io_mode(value: &str) -> Result<IoMode, String> {
+    match value {
+        "pipe" => Ok(IoMode::Pipe),
+        "tty" => Ok(IoMode::Tty),
+        _ => Err("I/O mode must be pipe or tty".into()),
+    }
 }
 fn parse_duration(value: &str) -> Result<Duration, String> {
     if let Some(v) = value.strip_suffix("ms") {

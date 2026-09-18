@@ -26,17 +26,25 @@ amux workspace create dev --root-dir "$PWD"
 
 ## Run processes
 
-Use pipe mode for services and watchers:
+`amux run` defaults to pipe mode outside managed contexts. Treefold Sessions
+set `AMUX_IO_MODE=tty` so services and watchers open as interactive terminals
+in the sidebar, including Ctrl+C support. Keep this inherited default:
 
 ```bash
 amux run --name api -- cargo run
 amux run --name web -- npm run dev
 ```
 
-Use `--tty` only when the command needs terminal semantics:
+Use `--tty` when terminal semantics are required regardless of the inherited default:
 
 ```bash
 amux run --name repl --tty -- python
+```
+
+Use `--io-mode pipe` explicitly when separate stdout/stderr pipes are required:
+
+```bash
+amux run --name batch --io-mode pipe -- ./batch-job
 ```
 
 Choose stable, descriptive names. Do not use amux as a second child-Agent orchestrator when the active Agent already provides delegation.
