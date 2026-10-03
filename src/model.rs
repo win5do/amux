@@ -91,7 +91,7 @@ pub struct Environment {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Process {
     pub schema_version: u32,
     pub id: String,

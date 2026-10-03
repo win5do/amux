@@ -243,11 +243,11 @@ impl Store {
         let path = self
             .process_dir(&process.workspace_id, &process.id)
             .join("metadata.json");
-        if let Ok(current) = read_json::<Process>(&path)
-            && (current.execution > process.execution
-                || (current.execution == process.execution
-                    && current.state.terminal()
-                    && !process.state.terminal()))
+        let current = read_json::<Process>(&path).context("update existing process")?;
+        if current.execution > process.execution
+            || (current.execution == process.execution
+                && current.state.terminal()
+                && !process.state.terminal())
         {
             return Ok(());
         }
@@ -437,5 +437,40 @@ mod tests {
             )
             .unwrap();
         assert!(store.find_process("api").is_err());
+    }
+
+    #[test]
+    fn removal_releases_the_name_and_updates_cannot_recreate_the_record() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let workspace = store
+            .create_workspace(CreateWorkspaceRequest {
+                name: "dev".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let request = || RunRequest {
+            name: "worker".into(),
+            command: vec!["true".into()],
+            ..Default::default()
+        };
+        let mut process = store
+            .create_process(&workspace, request(), "boot".into())
+            .unwrap();
+        process.state = ProcessState::Exited;
+        store.save_process(&process).unwrap();
+        assert!(
+            store
+                .create_process(&workspace, request(), "boot".into())
+                .is_err()
+        );
+        store.remove_process(&process).unwrap();
+        assert!(store.save_process(&process).is_err());
+        assert!(!store.process_dir(&workspace.id, &process.id).exists());
+        assert!(
+            store
+                .create_process(&workspace, request(), "boot".into())
+                .is_ok()
+        );
     }
 }

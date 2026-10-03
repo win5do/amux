@@ -14,6 +14,194 @@ use tokio_tungstenite::tungstenite::Message;
 
 static E2E_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+struct OwnedDaemon(Child);
+
+impl Drop for OwnedDaemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[tokio::test]
+async fn single_process_stop_remove_and_recreate_preserves_event_order() {
+    use amux::model::{
+        CreateWorkspaceRequest, IoMode, ProcessEvent, ProcessEventKind, ProcessSnapshot,
+        RunRequest, StopRequest,
+    };
+    use amux::protocol::Response;
+    use http::Method;
+
+    let _guard = E2E_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let socket = temp.path().join("amux.sock");
+    let _daemon = OwnedDaemon(daemon(&state, &socket));
+    let client = Client::new(Config {
+        state_dir: state.clone(),
+        socket,
+    });
+    client
+        .do_json(
+            Method::POST,
+            "/v1/workspaces",
+            Some(&CreateWorkspaceRequest {
+                name: "dev".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    let snapshot: ProcessSnapshot = serde_json::from_slice(
+        &client
+            .do_empty(Method::GET, "/v1/processes/snapshot")
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let mut events = client
+        .stream(&format!(
+            "/v1/processes/events?after={}&instance={}",
+            snapshot.sequence, snapshot.daemon_instance_id
+        ))
+        .await
+        .unwrap();
+    let run = |index| RunRequest {
+        name: "worker".into(),
+        command: vec!["/bin/sleep".into(), "30".into()],
+        io_mode: if index % 2 == 0 {
+            IoMode::Tty
+        } else {
+            IoMode::Pipe
+        },
+        ..Default::default()
+    };
+    let mut current: Response = serde_json::from_slice(
+        &client
+            .do_json(Method::POST, "/v1/workspaces/dev/processes", Some(&run(0)))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let mut pending = Vec::new();
+    let mut seen = Vec::<ProcessEvent>::new();
+    for index in 0..6 {
+        let process = current.process.as_ref().unwrap().process.clone();
+        if index == 0 {
+            assert!(
+                client
+                    .do_json(Method::POST, "/v1/workspaces/dev/processes", Some(&run(0)))
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("name_conflict")
+            );
+        }
+        client
+            .do_json(
+                Method::POST,
+                "/v1/processes/dev/worker/stop",
+                Some(&StopRequest { grace_millis: 100 }),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client.do_empty(Method::GET, "/v1/processes/dev/worker/wait"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        if index == 0 {
+            assert!(
+                client
+                    .do_json(Method::POST, "/v1/workspaces/dev/processes", Some(&run(0)))
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("name_conflict")
+            );
+        }
+        client
+            .do_empty(Method::DELETE, "/v1/processes/dev/worker")
+            .await
+            .unwrap();
+        // Recreate immediately, before reading queued lifecycle events. No keeper process.
+        current = serde_json::from_slice(
+            &client
+                .do_json(
+                    Method::POST,
+                    "/v1/workspaces/dev/processes",
+                    Some(&run(index + 1)),
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let next_id = &current.process.as_ref().unwrap().process.id;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !seen.iter().any(|event| &event.process_id == next_id) {
+            let frame = tokio::time::timeout_at(deadline, events.frame())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            pending.extend_from_slice(&frame.into_data().unwrap_or_default());
+            while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
+                let line: Vec<_> = pending.drain(..=end).collect();
+                seen.push(serde_json::from_slice(&line).unwrap());
+            }
+        }
+        let lifecycle: Vec<_> = seen
+            .iter()
+            .filter(|event| event.process_id == process.id)
+            .map(|event| event.kind.clone())
+            .collect();
+        assert_eq!(lifecycle.first(), Some(&ProcessEventKind::ProcessCreated));
+        assert!(lifecycle.contains(&ProcessEventKind::ProcessStarted));
+        assert_eq!(
+            lifecycle
+                .iter()
+                .filter(|kind| **kind == ProcessEventKind::ProcessExited)
+                .count(),
+            1
+        );
+        assert_eq!(lifecycle.last(), Some(&ProcessEventKind::ProcessRemoved));
+        assert!(
+            !state
+                .join("workspaces")
+                .join(&process.workspace_id)
+                .join("processes")
+                .join(&process.id)
+                .exists()
+        );
+    }
+    assert!(
+        seen.windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence)
+    );
+    // Workspace deletion must also finish when its last supervisor has unloaded.
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        client.do_empty(Method::DELETE, "/v1/workspaces/dev"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let snapshot: ProcessSnapshot = serde_json::from_slice(
+        &client
+            .do_empty(Method::GET, "/v1/processes/snapshot")
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(snapshot.processes.is_empty());
+    client
+        .do_empty(Method::POST, "/v1/admin/stop")
+        .await
+        .unwrap();
+}
+
 fn daemon(state: &Path, socket: &Path) -> Child {
     daemon_with_env(state, socket, &[])
 }
@@ -116,7 +304,7 @@ async fn pipe_lifecycle_and_daemon_recovery() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
     let socket = temp.path().join("amux.sock");
-    let mut first = daemon(&state, &socket);
+    let mut first = OwnedDaemon(daemon(&state, &socket));
 
     ok(&state, &socket, &["workspace", "create", "dev"]);
     ok_in_workspace(
@@ -206,8 +394,8 @@ async fn pipe_lifecycle_and_daemon_recovery() {
     let pid = serde_json::from_str::<serde_json::Value>(&before).unwrap()["process"]["pid"]
         .as_i64()
         .unwrap();
-    first.kill().unwrap();
-    first.wait().unwrap();
+    first.0.kill().unwrap();
+    first.0.wait().unwrap();
     let deadline = Instant::now() + Duration::from_secs(12);
     while unsafe { libc::kill(pid as i32, 0) } == 0 {
         assert!(
@@ -216,14 +404,21 @@ async fn pipe_lifecycle_and_daemon_recovery() {
         );
         thread::sleep(Duration::from_millis(50));
     }
-    let mut second = daemon(&state, &socket);
-    let after = ok(&state, &socket, &["--json", "inspect", "dev/survivor"]);
+    let _second = OwnedDaemon(daemon(&state, &socket));
+    // PID disappearance precedes the shim's final metadata write. The new daemon
+    // must recover that terminal state even without the old lifecycle bridge.
+    let after = tokio::time::timeout(
+        Duration::from_secs(5),
+        compatibility_client.do_empty(http::Method::GET, "/v1/processes/dev/survivor/wait"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let after = std::str::from_utf8(&after).unwrap();
     assert!(after.contains("\"state\":\"exited\"") || after.contains("\"state\":\"failed\""));
     ok(&state, &socket, &["rm", "dev/survivor"]);
     ok(&state, &socket, &["rm", "dev/io"]);
     ok(&state, &socket, &["workspace", "rm", "dev"]);
-    second.kill().unwrap();
-    let _ = second.wait();
 }
 
 #[tokio::test]

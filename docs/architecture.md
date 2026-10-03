@@ -32,8 +32,19 @@ disk. A shim retains only the latest 4096 output event descriptors for live
 coordination; a lagging follower catches up from disk and receives a `gap`
 record only if rotation has already discarded the requested sequence. TTY
 replay remains capped at 4 MiB. Terminal supervisors are unloaded from the
-group shim after metadata and lifecycle state have been persisted, so later
-inspect, wait, and log requests use the durable store.
+group shim after metadata and lifecycle state have been persisted. Later inspect
+and log requests use the durable store.
+
+The shim persists each lifecycle transition before publishing its notification,
+and drains queued notifications before closing the last process's group socket.
+The daemon keeps an ordered in-memory process snapshot for lifecycle events and
+wait requests. Notifications never write their snapshots back to metadata.
+Removal shares the event lock, waits for the terminal state to be observed, and
+removes the process from that snapshot; late notifications cannot register it
+again. Restart advances the execution number so older notifications are ignored.
+Disk reconciliation at startup, on bridge reconnect, and periodically repairs
+missed notifications. Process names remain unique within each workspace across
+all records, including stopped processes; deleting a record releases its name.
 
 The daemon and group shim redirect their own stdout and stderr through an
 in-process rotating writer. Their active `amuxd.log` and `shim.log` files use

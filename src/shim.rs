@@ -2,7 +2,6 @@ use std::{
     collections::{BTreeMap, VecDeque},
     convert::Infallible,
     fs,
-    future::IntoFuture,
     io::{Read, Write},
     os::unix::{fs::PermissionsExt, process::CommandExt},
     path::PathBuf,
@@ -36,9 +35,8 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::{
     net::UnixListener,
-    sync::{broadcast, mpsc},
+    sync::{broadcast, mpsc, watch},
 };
-use tokio_stream::wrappers::BroadcastStream;
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use crate::{
@@ -105,7 +103,7 @@ pub struct GroupShim {
     socket: PathBuf,
     processes: Arc<Mutex<BTreeMap<String, Shim>>>,
     lifecycle: broadcast::Sender<Process>,
-    shutdown: Arc<tokio::sync::Notify>,
+    shutdown: watch::Sender<bool>,
     log_config: LogConfig,
 }
 
@@ -123,7 +121,7 @@ impl GroupShim {
             socket: socket.into(),
             processes: Arc::new(Mutex::new(BTreeMap::new())),
             lifecycle,
-            shutdown: Arc::new(tokio::sync::Notify::new()),
+            shutdown: watch::channel(false).0,
             log_config,
         })
     }
@@ -168,7 +166,7 @@ impl GroupShim {
                     libc::close(fd);
                 }
                 group.terminate_all();
-                group.shutdown.notify_waiters();
+                group.shutdown.send_replace(true);
             });
         }
         if let Some(fd) = ready_fd {
@@ -183,11 +181,17 @@ impl GroupShim {
                     Ok(process) => {
                         if process.state.terminal() {
                             let mut processes = idle_group.processes.lock().unwrap();
-                            processes.remove(&process.id);
+                            if processes.get(&process.id).is_some_and(|shim| {
+                                let inner = shim.inner.lock().unwrap();
+                                inner.process.execution == process.execution
+                                    && inner.process.state.terminal()
+                            }) {
+                                processes.remove(&process.id);
+                            }
                             debug!(process_id = %process.id, "terminal supervisor unloaded");
                             if processes.is_empty() {
+                                idle_group.shutdown.send_replace(true);
                                 drop(processes);
-                                idle_group.shutdown.notify_waiters();
                                 break;
                             }
                         }
@@ -197,8 +201,8 @@ impl GroupShim {
                         processes
                             .retain(|_, shim| !shim.inner.lock().unwrap().process.state.terminal());
                         if processes.is_empty() {
+                            idle_group.shutdown.send_replace(true);
                             drop(processes);
-                            idle_group.shutdown.notify_waiters();
                             break;
                         }
                     }
@@ -216,14 +220,18 @@ impl GroupShim {
             .route("/v1/processes/{id}/attach", any(group_attach))
             .route("/v1/shutdown", post(group_shutdown))
             .with_state(self.clone());
-        let stopping = self.shutdown.clone();
-        let server = axum::serve(listener, app).into_future();
-        tokio::pin!(server);
-        let result = tokio::select! {
-            value = &mut server => value,
-            _ = stopping.notified() => Ok(()),
-        };
-        let _ = fs::remove_file(&self.socket);
+        let mut stopping = self.shutdown.subscribe();
+        let socket = self.socket.clone();
+        let result = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = stopping.wait_for(|stopping| *stopping).await;
+                // New launches wait for this bridge to drain before reusing its socket.
+                let _ = fs::remove_file(socket);
+            })
+            .await;
+        if !*self.shutdown.borrow() {
+            let _ = fs::remove_file(&self.socket);
+        }
         result?;
         info!("group shim stopped");
         Ok(())
@@ -281,18 +289,16 @@ async fn group_start(
     let id = shim.inner.lock().unwrap().process.id.clone();
     {
         let mut processes = group.processes.lock().unwrap();
+        if *group.shutdown.borrow() {
+            return (StatusCode::SERVICE_UNAVAILABLE, "group shim is stopping").into_response();
+        }
         if let Some(existing) = processes.get(&id)
             && !existing.inner.lock().unwrap().process.state.terminal()
         {
             return Json(json!({"ok":true})).into_response();
         }
-        processes.remove(&id);
+        processes.insert(id.clone(), shim.clone());
     }
-    group
-        .processes
-        .lock()
-        .unwrap()
-        .insert(id.clone(), shim.clone());
     if let Err(error) = shim.start_process() {
         shim.fail_wait(&error);
         return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
@@ -301,7 +307,8 @@ async fn group_start(
 }
 
 async fn group_events(State(group): State<GroupShim>) -> Response {
-    let receiver = group.lifecycle.subscribe();
+    let mut receiver = group.lifecycle.subscribe();
+    let mut stopping = group.shutdown.subscribe();
     let initial = group
         .processes
         .lock()
@@ -315,12 +322,29 @@ async fn group_events(State(group): State<GroupShim>) -> Response {
             })
         })
         .collect::<Vec<_>>();
-    let follow = tokio_stream::StreamExt::filter_map(BroadcastStream::new(receiver), |item| {
-        let process = item.ok()?;
-        let mut line = serde_json::to_vec(&process).ok()?;
-        line.push(b'\n');
-        Some(Ok::<_, Infallible>(Bytes::from(line)))
-    });
+    let follow = async_stream::stream! {
+        loop {
+            let process = if *stopping.borrow() {
+                // Closing the listener must not discard the final queued notification.
+                match receiver.try_recv() {
+                    Ok(process) => process,
+                    Err(_) => break,
+                }
+            } else {
+                tokio::select! {
+                    item = receiver.recv() => match item {
+                        Ok(process) => process,
+                        Err(_) => break, // Reconnection obtains a fresh snapshot.
+                    },
+                    _ = stopping.changed() => continue,
+                }
+            };
+            if let Ok(mut line) = serde_json::to_vec(&process) {
+                line.push(b'\n');
+                yield Ok::<_, Infallible>(Bytes::from(line));
+            }
+        }
+    };
     Body::from_stream(tokio_stream::StreamExt::chain(
         tokio_stream::iter(initial),
         follow,
@@ -376,16 +400,14 @@ async fn group_attach(
     }
 }
 async fn group_shutdown(State(group): State<GroupShim>) -> Response {
-    if group
-        .processes
-        .lock()
-        .unwrap()
+    let processes = group.processes.lock().unwrap();
+    if processes
         .values()
         .any(|s| !s.inner.lock().unwrap().process.state.terminal())
     {
         return (StatusCode::CONFLICT, "group still has running processes").into_response();
     }
-    group.shutdown.notify_waiters();
+    group.shutdown.send_replace(true);
     Json(json!({"ok":true})).into_response()
 }
 
@@ -523,7 +545,7 @@ impl Shim {
         if let Some(stderr) = child.stderr.take() {
             self.spawn_reader("stderr", stderr);
         }
-        let running = {
+        {
             let mut inner = self.inner.lock().unwrap();
             inner.input = stdin;
             inner.process.pid = pid;
@@ -531,9 +553,8 @@ impl Shim {
             inner.process.state = ProcessState::Running;
             inner.process.started_at = Some(Utc::now());
             atomic_json(&self.dir.join("metadata.json"), &inner.process)?;
-            inner.process.clone()
+            self.publish_lifecycle(&inner.process);
         };
-        self.publish_lifecycle(&running);
         info!(process_id = %process.id, execution = process.execution, pid, io_mode = "pipe", "process started");
         self.spawn_wait_pipe(child);
         Ok(())
@@ -558,7 +579,7 @@ impl Shim {
         let pid = child.process_id().unwrap_or(0) as i32;
         let reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
-        let running = {
+        {
             let mut inner = self.inner.lock().unwrap();
             inner.input = Some(writer);
             inner.pty = Some(pair.master);
@@ -567,9 +588,8 @@ impl Shim {
             inner.process.state = ProcessState::Running;
             inner.process.started_at = Some(Utc::now());
             atomic_json(&self.dir.join("metadata.json"), &inner.process)?;
-            inner.process.clone()
+            self.publish_lifecycle(&inner.process);
         };
-        self.publish_lifecycle(&running);
         info!(process_id = %process.id, execution = process.execution, pid, io_mode = "tty", "process started");
         self.spawn_reader("tty", reader);
         self.spawn_wait_pty(child);
@@ -652,7 +672,7 @@ impl Shim {
         }
         drop(count);
         self.sync_output();
-        let (process, message) = {
+        let process = {
             let mut inner = self.inner.lock().unwrap();
             inner.process.exit_code = Some(code.unwrap_or(-1));
             inner.process.exit_signal = signal.and_then(signal_name).unwrap_or_default();
@@ -663,11 +683,11 @@ impl Shim {
                 error!(%error, process_id = %inner.process.id, "persist terminal process state failed");
             }
             let message = serde_json::to_string(&json!({"type":"exit","exit_code":inner.process.exit_code,"signal":inner.process.exit_signal})).unwrap_or_default();
-            (inner.process.clone(), message)
+            let _ = self.output.send(WireMessage::Text(message));
+            self.publish_lifecycle(&inner.process);
+            inner.process.clone()
         };
-        self.publish_lifecycle(&process);
         info!(process_id = %process.id, execution = process.execution, exit_code = ?process.exit_code, signal = %process.exit_signal, "process exited");
-        let _ = self.output.send(WireMessage::Text(message));
     }
 
     fn fail_wait(&self, error: impl std::fmt::Display) {
@@ -681,9 +701,9 @@ impl Shim {
             {
                 error!(error = %persist_error, process_id = %inner.process.id, "persist failed process state failed");
             }
+            self.publish_lifecycle(&inner.process);
             inner.process.clone()
         };
-        self.publish_lifecycle(&process);
         error!(process_id = %process.id, execution = process.execution, error = %process.error, "process wait failed");
         let _ = self.output.send(WireMessage::Text(
             serde_json::to_string(&json!({"type":"exit","error":"process wait failed"}))
@@ -756,9 +776,9 @@ async fn stop(State(shim): State<Shim>, Json(request): Json<StopRequest>) -> Res
         if let Err(error) = atomic_json(&shim.dir.join("metadata.json"), &inner.process) {
             error!(%error, process_id = %inner.process.id, "persist stopping process state failed");
         }
+        shim.publish_lifecycle(&inner.process);
         (inner.process.process_group_id, inner.process.clone())
     };
-    shim.publish_lifecycle(&process);
     info!(process_id = %process.id, grace_millis = request.grace_millis, "stopping process");
     let _ = killpg(Pid::from_raw(pgid), Signal::SIGTERM);
     let delayed = shim.clone();
@@ -1429,3 +1449,6 @@ fn write_ready(fd: i32) {
         libc::close(fd);
     }
 }
+
+#[cfg(test)]
+mod tests;

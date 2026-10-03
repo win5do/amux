@@ -65,6 +65,8 @@ pub struct Daemon {
     shutdown: Arc<Notify>,
     group_lifelines: Arc<Mutex<BTreeMap<String, fs::File>>>,
     group_event_bridges: Arc<Mutex<HashSet<String>>>,
+    group_bridge_changed: Arc<Notify>,
+    group_launch_locks: Arc<Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     last_request: Arc<AtomicU64>,
     log_config: LogConfig,
 }
@@ -74,7 +76,7 @@ const EVENT_BUFFER_LIMIT: usize = 4096;
 struct EventHub {
     sequence: u64,
     buffer: VecDeque<ProcessEvent>,
-    fingerprints: BTreeMap<String, String>,
+    processes: BTreeMap<String, Process>,
 }
 
 impl Daemon {
@@ -105,12 +107,14 @@ impl Daemon {
             events: Arc::new(Mutex::new(EventHub {
                 sequence: 0,
                 buffer: VecDeque::new(),
-                fingerprints: BTreeMap::new(),
+                processes: BTreeMap::new(),
             })),
             event_tx,
             shutdown: Arc::new(Notify::new()),
             group_lifelines: Arc::new(Mutex::new(BTreeMap::new())),
             group_event_bridges: Arc::new(Mutex::new(HashSet::new())),
+            group_bridge_changed: Arc::new(Notify::new()),
+            group_launch_locks: Arc::new(Mutex::new(BTreeMap::new())),
             last_request: Arc::new(AtomicU64::new(now_seconds())),
             log_config,
         })
@@ -131,12 +135,14 @@ impl Daemon {
             events: Arc::new(Mutex::new(EventHub {
                 sequence: 0,
                 buffer: VecDeque::new(),
-                fingerprints: BTreeMap::new(),
+                processes: BTreeMap::new(),
             })),
             event_tx,
             shutdown: Arc::new(Notify::new()),
             group_lifelines: Arc::new(Mutex::new(BTreeMap::new())),
             group_event_bridges: Arc::new(Mutex::new(HashSet::new())),
+            group_bridge_changed: Arc::new(Notify::new()),
+            group_launch_locks: Arc::new(Mutex::new(BTreeMap::new())),
             last_request: Arc::new(AtomicU64::new(now_seconds())),
             log_config,
         })
@@ -193,6 +199,12 @@ impl Daemon {
     }
 
     async fn serve_runtime(self, ready_fd: Option<i32>, lock: fs::File) -> Result<()> {
+        self.events.lock().unwrap().processes = self
+            .store
+            .list_processes(None)?
+            .into_iter()
+            .map(|process| (process.id.clone(), process))
+            .collect();
         if self.config.socket.exists() {
             debug!(socket = %self.config.socket.display(), "removing stale daemon socket");
             let _ = fs::remove_file(&self.config.socket);
@@ -307,6 +319,14 @@ impl Daemon {
     }
 
     async fn launch_shim(&self, process: &mut Process) -> Result<()> {
+        let launch_lock = self
+            .group_launch_locks
+            .lock()
+            .unwrap()
+            .entry(process.group_id.clone())
+            .or_default()
+            .clone();
+        let _launch = launch_lock.lock().await;
         let socket = self.shim_socket(process);
         process.runtime_handle.clear();
         self.store.save_process(process)?;
@@ -314,43 +334,62 @@ impl Daemon {
         let args = self.shim_args.clone();
         let process_dir = self.store.process_dir(&process.workspace_id, &process.id);
         let workspace_dir = self.store.workspace_dir(&process.workspace_id);
-        if !socket.exists() {
-            if self.embedded_shims {
-                let group = crate::shim::GroupShim::load(&workspace_dir, &socket)?;
-                tokio::spawn(async move {
-                    if let Err(error) = group.serve(None, None).await {
-                        error!(%error, "embedded group shim failed");
+        loop {
+            if !socket.exists() {
+                self.wait_for_group_bridge(&process.group_id).await?;
+                if self.embedded_shims {
+                    let group = crate::shim::GroupShim::load(&workspace_dir, &socket)?;
+                    tokio::spawn(async move {
+                        if let Err(error) = group.serve(None, None).await {
+                            error!(%error, "embedded group shim failed");
+                        }
+                    });
+                    for _ in 0..100 {
+                        if socket.exists() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
                     }
-                });
-                for _ in 0..100 {
-                    if socket.exists() {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                } else {
+                    let launch_socket = socket.clone();
+                    let path = path.clone();
+                    let args = args.clone();
+                    let workspace_dir = workspace_dir.clone();
+                    let (group_id, lifeline) = tokio::task::spawn_blocking(move || {
+                        launch_detached(&path, &args, &workspace_dir, &launch_socket)
+                    })
+                    .await??;
+                    self.group_lifelines
+                        .lock()
+                        .unwrap()
+                        .insert(group_id, lifeline);
                 }
-            } else {
-                let launch_socket = socket.clone();
-                let (group_id, lifeline) = tokio::task::spawn_blocking(move || {
-                    launch_detached(&path, &args, &workspace_dir, &launch_socket)
-                })
-                .await??;
-                self.group_lifelines
-                    .lock()
-                    .unwrap()
-                    .insert(group_id, lifeline);
+                info!(group_id = %process.group_id, workspace_id = %process.workspace_id, "group shim launched");
             }
-            info!(group_id = %process.group_id, workspace_id = %process.workspace_id, "group shim launched");
+            self.ensure_group_event_bridge(process.group_id.clone(), socket.clone())
+                .await?;
+            let started = unix_http::json_request::<serde_json::Value>(
+                &self.shim_socket(process),
+                Method::POST,
+                "/v1/processes",
+                Some(Bytes::from(serde_json::to_vec(
+                    &json!({"process_dir": process_dir}),
+                )?)),
+            )
+            .await;
+            match started {
+                Ok(_) => break,
+                Err(error)
+                    if error.to_string().contains("group shim is stopping")
+                        || (!socket.exists() && error.to_string().starts_with("connect ")) =>
+                {
+                    // A last-process exit may retire the listener while this launch arrives.
+                    // Wait for that exact bridge to finish before creating its replacement.
+                    self.wait_for_group_bridge(&process.group_id).await?;
+                }
+                Err(error) => return Err(error),
+            }
         }
-        self.ensure_group_event_bridge(process.group_id.clone(), socket.clone());
-        unix_http::json_request::<serde_json::Value>(
-            &self.shim_socket(process),
-            Method::POST,
-            "/v1/processes",
-            Some(Bytes::from(serde_json::to_vec(
-                &json!({"process_dir": process_dir}),
-            )?)),
-        )
-        .await?;
         for _ in 0..100 {
             if let Ok(value) = self.shim_status(process).await {
                 *process = value;
@@ -368,17 +407,49 @@ impl Daemon {
         Ok(())
     }
 
-    fn ensure_group_event_bridge(&self, group_id: String, socket: PathBuf) {
+    async fn wait_for_group_bridge(&self, group_id: &str) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let changed = self.group_bridge_changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if !self.group_event_bridges.lock().unwrap().contains(group_id) {
+                    break;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .context("group event bridge did not finish")
+    }
+
+    fn reconcile_group(&self, group_id: &str) {
+        match self.store.list_processes(None) {
+            Ok(processes) => {
+                for process in processes
+                    .into_iter()
+                    .filter(|process| process.group_id == group_id)
+                {
+                    self.observe_process(process);
+                }
+            }
+            Err(error) => warn!(%error, %group_id, "group state reconciliation failed"),
+        }
+    }
+
+    async fn ensure_group_event_bridge(&self, group_id: String, socket: PathBuf) -> Result<()> {
         if !self
             .group_event_bridges
             .lock()
             .unwrap()
             .insert(group_id.clone())
         {
-            return;
+            return Ok(());
         }
+        let (ready, connected) = tokio::sync::oneshot::channel();
         let daemon = self.clone();
         tokio::spawn(async move {
+            let mut ready = Some(ready);
             let mut retry_delay = Duration::from_millis(250);
             loop {
                 let request = Request::builder()
@@ -390,6 +461,10 @@ impl Daemon {
                     && response.status().is_success()
                 {
                     debug!(group_id = %group_id, "group event bridge connected");
+                    daemon.reconcile_group(&group_id);
+                    if let Some(ready) = ready.take() {
+                        let _ = ready.send(());
+                    }
                     retry_delay = Duration::from_millis(250);
                     let mut body = response.into_body();
                     let mut pending = Vec::new();
@@ -404,6 +479,7 @@ impl Daemon {
                         }
                     }
                 }
+                daemon.reconcile_group(&group_id);
                 if !socket.exists() {
                     break;
                 }
@@ -411,43 +487,89 @@ impl Daemon {
                 tokio::time::sleep(retry_delay).await;
                 retry_delay = (retry_delay * 2).min(Duration::from_secs(10));
             }
-            daemon.group_event_bridges.lock().unwrap().remove(&group_id);
             daemon.group_lifelines.lock().unwrap().remove(&group_id);
+            daemon.group_event_bridges.lock().unwrap().remove(&group_id);
+            daemon.group_bridge_changed.notify_waiters();
             debug!(group_id = %group_id, "group event bridge removed");
         });
+        tokio::time::timeout(Duration::from_secs(5), connected)
+            .await
+            .context("group event bridge connection timed out")?
+            .context("group event bridge closed before connecting")
     }
 
     fn observe_process(&self, process: Process) {
-        let fingerprint = serde_json::to_string(&process).unwrap_or_default();
-        let kind = {
-            let mut hub = self.events.lock().unwrap();
-            if hub.fingerprints.get(&process.id) == Some(&fingerprint) {
-                return;
-            }
-            let kind = if hub.fingerprints.contains_key(&process.id) {
-                if process.state == ProcessState::Exited {
-                    ProcessEventKind::ProcessExited
-                } else if process.state == ProcessState::Failed {
-                    ProcessEventKind::ProcessUpdated
-                } else if process.state == ProcessState::Running {
-                    ProcessEventKind::ProcessStarted
-                } else {
-                    ProcessEventKind::ProcessUpdated
-                }
-            } else {
-                ProcessEventKind::ProcessCreated
-            };
-            hub.fingerprints.insert(process.id.clone(), fingerprint);
-            kind
+        let mut hub = self.events.lock().unwrap();
+        let Some(current) = hub.processes.get(&process.id) else {
+            return; // Only explicit creation can register a process, never a late event.
         };
-        let terminal = process.state.terminal();
-        if let Err(error) = self.store.save_process(&process) {
-            error!(%error, process_id = %process.id, "persist process observation failed");
+        if current == &process
+            || current.execution != process.execution
+            || (current.state.terminal() && !process.state.terminal())
+        {
+            return;
         }
-        self.emit(kind, process.clone());
-        if terminal {
-            self.events.lock().unwrap().fingerprints.remove(&process.id);
+        let kind = match process.state {
+            ProcessState::Exited => ProcessEventKind::ProcessExited,
+            ProcessState::Running => ProcessEventKind::ProcessStarted,
+            _ => ProcessEventKind::ProcessUpdated,
+        };
+        // The shim owns persisted execution state. Event delivery must not write
+        // an earlier snapshot over that state or recreate a removed directory.
+        self.emit_locked(&mut hub, kind, process);
+        drop(hub);
+        self.update_registration_counts();
+    }
+
+    async fn wait_for_terminal(&self, process: &Process) -> Result<Process> {
+        let mut events = self.event_tx.subscribe();
+        loop {
+            {
+                let hub = self.events.lock().unwrap();
+                let current = hub
+                    .processes
+                    .get(&process.id)
+                    .context("process not found")?;
+                anyhow::ensure!(
+                    current.execution == process.execution,
+                    "process execution changed"
+                );
+                if current.state.terminal() {
+                    return Ok(current.clone());
+                }
+            }
+            tokio::select! {
+                event = events.recv() => match event {
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(error) => return Err(error.into()),
+                },
+                // After daemon recovery there may be no bridge for the old shim.
+                // Healthy streams keep their event ordering and do not poll disk.
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                    if !self.group_event_bridges.lock().unwrap().contains(&process.group_id) {
+                        self.reconcile_group(&process.group_id);
+                    }
+                }
+            }
         }
+    }
+
+    fn remove_process(&self, process: &Process) -> Result<()> {
+        let mut hub = self.events.lock().unwrap();
+        let current = hub
+            .processes
+            .get(&process.id)
+            .context("process not found")?;
+        anyhow::ensure!(
+            current.execution == process.execution && current.state.terminal(),
+            "process changed before removal"
+        );
+        let current = current.clone();
+        self.store.remove_process(&current)?;
+        self.emit_locked(&mut hub, ProcessEventKind::ProcessRemoved, current);
+        drop(hub);
+        self.update_registration_counts();
+        Ok(())
     }
 
     fn view(&self, process: Process) -> ProcessView {
@@ -488,15 +610,19 @@ impl Daemon {
     }
 
     fn emit(&self, kind: ProcessEventKind, process: Process) {
+        self.emit_locked(&mut self.events.lock().unwrap(), kind, process);
+        self.update_registration_counts();
+    }
+
+    // Called with the same lock used for removal and lifecycle observation.
+    fn emit_locked(&self, hub: &mut EventHub, kind: ProcessEventKind, process: Process) {
         let view = self.view(process.clone());
-        let fingerprint = serde_json::to_string(&process).unwrap_or_default();
         let event = {
-            let mut hub = self.events.lock().unwrap();
             hub.sequence += 1;
-            if kind == ProcessEventKind::ProcessRemoved || process.state.terminal() {
-                hub.fingerprints.remove(&process.id);
+            if kind == ProcessEventKind::ProcessRemoved {
+                hub.processes.remove(&process.id);
             } else {
-                hub.fingerprints.insert(process.id.clone(), fingerprint);
+                hub.processes.insert(process.id.clone(), process.clone());
             }
             let event = ProcessEvent {
                 kind: kind.clone(),
@@ -539,7 +665,6 @@ impl Daemon {
                 "process updated"
             ),
         }
-        self.update_registration_counts();
     }
 
     fn update_registration_counts(&self) {
@@ -580,9 +705,7 @@ impl Daemon {
                 }
             };
             for process in processes {
-                if !process.state.terminal() {
-                    self.observe_process(process);
-                }
+                self.observe_process(process);
             }
         }
     }
@@ -674,11 +797,10 @@ async fn process_snapshot(State(daemon): State<Daemon>) -> AxumResponse {
     let snapshot = ProcessSnapshot {
         daemon_instance_id: daemon.instance_id.as_ref().clone(),
         sequence: hub.sequence,
-        processes: daemon
-            .store
-            .list_processes(None)
-            .unwrap_or_default()
-            .into_iter()
+        processes: hub
+            .processes
+            .values()
+            .cloned()
             .map(|p| daemon.view(p))
             .collect(),
     };
@@ -984,19 +1106,16 @@ async fn process_route(
         Some("logs") | Some("signal") | Some("stop") => {
             return proxy_http(&daemon, &process, action.unwrap(), request).await;
         }
-        Some("wait") => loop {
-            if let Ok(value) = daemon.shim_status(&process).await {
-                process = value;
-            } else if let Ok(value) = daemon.store.find_process(&process.id) {
-                process = value;
-            }
-            if process.state.terminal() {
-                let mut response = Response::ok();
-                response.process = Some(daemon.view(process));
-                return Json(response).into_response();
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        },
+        Some("wait") => {
+            return match daemon.wait_for_terminal(&process).await {
+                Ok(process) => {
+                    let mut response = Response::ok();
+                    response.process = Some(daemon.view(process));
+                    Json(response).into_response()
+                }
+                Err(error) => api_error(StatusCode::CONFLICT, "invalid_state", error),
+            };
+        }
         Some("restart") => return restart_process(daemon, process).await,
         _ => {}
     }
@@ -1020,11 +1139,11 @@ async fn process_route(
                     anyhow!("running process must be stopped before removal"),
                 );
             }
-            match daemon.store.remove_process(&process) {
-                Ok(()) => {
-                    daemon.emit(ProcessEventKind::ProcessRemoved, process);
-                    Json(json!({"ok":true})).into_response()
-                }
+            if let Err(error) = daemon.wait_for_terminal(&process).await {
+                return api_error(StatusCode::CONFLICT, "invalid_state", error);
+            }
+            match daemon.remove_process(&process) {
+                Ok(()) => Json(json!({"ok":true})).into_response(),
                 Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e),
             }
         }
@@ -1240,6 +1359,11 @@ async fn restart_process(daemon: Daemon, mut process: Process) -> AxumResponse {
             anyhow!("process cannot be safely restarted"),
         );
     }
+    if process.state.terminal()
+        && let Err(error) = daemon.wait_for_terminal(&process).await
+    {
+        return api_error(StatusCode::CONFLICT, "invalid_state", error);
+    }
     let group_has_other_active_processes = daemon
         .store
         .list_processes(None)
@@ -1263,9 +1387,24 @@ async fn restart_process(daemon: Daemon, mut process: Process) -> AxumResponse {
     process.boot_id = boot_id();
     process.started_at = None;
     process.finished_at = None;
-    if let Err(error) = daemon.store.save_process(&process) {
-        error!(%error, process_id = %process.id, "persist process restart state failed");
-        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", error);
+    {
+        let mut hub = daemon.events.lock().unwrap();
+        if !hub
+            .processes
+            .get(&process.id)
+            .is_some_and(|current| current.execution + 1 == process.execution)
+        {
+            return api_error(
+                StatusCode::CONFLICT,
+                "invalid_state",
+                "process changed before restart",
+            );
+        }
+        if let Err(error) = daemon.store.save_process(&process) {
+            error!(%error, process_id = %process.id, "persist process restart state failed");
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", error);
+        }
+        daemon.emit_locked(&mut hub, ProcessEventKind::ProcessUpdated, process.clone());
     }
     if let Err(error) = daemon.launch_shim(&mut process).await {
         error!(%error, process_id = %process.id, group_id = %process.group_id, "restart process supervisor failed");
@@ -1311,33 +1450,32 @@ async fn remove_workspace(
         }
     }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
-    loop {
-        let mut all = true;
-        for process in &mut processes {
-            if let Ok(value) = daemon.shim_status(process).await {
-                *process = value;
-            }
-            if !process.state.terminal() {
-                all = false;
-            }
-        }
-        if all {
-            break;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return api_error(
-                StatusCode::CONFLICT,
-                "invalid_state",
-                anyhow!("some processes did not stop"),
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
     for process in &processes {
+        let terminal = tokio::time::timeout_at(deadline, daemon.wait_for_terminal(process))
+            .await
+            .context("some processes did not stop")
+            .and_then(|result| result);
+        if let Err(error) = terminal {
+            return api_error(StatusCode::CONFLICT, "invalid_state", error);
+        }
         shutdown_shim(&daemon, process).await;
     }
+    let mut hub = daemon.events.lock().unwrap();
     match daemon.store.remove_workspace(&workspace) {
-        Ok(()) => Json(json!({"ok":true})).into_response(),
+        Ok(()) => {
+            let removed: Vec<_> = hub
+                .processes
+                .values()
+                .filter(|process| process.workspace_id == workspace.id)
+                .cloned()
+                .collect();
+            for process in removed {
+                daemon.emit_locked(&mut hub, ProcessEventKind::ProcessRemoved, process);
+            }
+            drop(hub);
+            daemon.update_registration_counts();
+            Json(json!({"ok":true})).into_response()
+        }
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e),
     }
 }
@@ -1578,3 +1716,6 @@ async fn shutdown_signal() {
         .expect("install SIGTERM handler");
     tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
 }
+
+#[cfg(test)]
+mod tests;
