@@ -872,7 +872,7 @@ mod tests {
             serde_json::to_vec(&event)
                 .unwrap()
                 .into_iter()
-                .chain([b'\n'])
+                .chain(*b"\n")
                 .collect::<Vec<_>>()
         );
     }
@@ -922,7 +922,7 @@ mod tests {
             serde_json::to_vec(&valid)
                 .unwrap()
                 .into_iter()
-                .chain([b'\n'])
+                .chain(*b"\n")
                 .collect::<Vec<_>>()
         );
     }

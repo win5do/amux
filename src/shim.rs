@@ -623,11 +623,12 @@ impl Shim {
             (inner.process.execution, inner.process.id.clone())
         };
         let mut output = self.output_runtime.lock().unwrap();
-        let event = match {
+        let append_result = {
             let OutputRuntime { state, files, .. } = &mut *output;
             self.output_log
                 .append(state, files, stream, bytes, execution)
-        } {
+        };
+        let event = match append_result {
             Ok(event) => event,
             Err(error) => {
                 error!(%error, process_id = %process_id, execution, stream, "persist process output failed");
@@ -1012,12 +1013,13 @@ async fn attach_socket(
         };
         let start = records
             .iter()
-            .find_map(|record| match record {
-                OutputReplay::Event(event) => Some(event.sequence.saturating_sub(1)),
+            .map(|record| match record {
+                OutputReplay::Event(event) => event.sequence.saturating_sub(1),
                 OutputReplay::Gap {
                     oldest_available, ..
-                } => Some(oldest_available.saturating_sub(1)),
+                } => oldest_available.saturating_sub(1),
             })
+            .next()
             .unwrap_or(boundary);
         if sink
             .send(Message::Text(
