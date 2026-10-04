@@ -1,7 +1,7 @@
 # amux
 
-`amux` is a persistent process and TTY runtime for AI agents, with seamless
-human attach. It is implemented entirely in Rust.
+`amux` is a persistent process and TTY runtime for AI agents, with durable logs
+and human attach. It is implemented entirely in Rust.
 
 A workspace is a durable logical context backed by a named daemon. Processes in
 the same physical workspace share a group shim while retaining independent
@@ -119,6 +119,8 @@ covers Treefold/CLI reconnects. Stopping or losing a daemon deliberately stops
 all of its group shims and business process groups.
 
 ## License
+
+Copyright (c) 2026 win5do and amux contributors.
 
 Licensed under either of:
 

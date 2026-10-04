@@ -2,8 +2,9 @@
 name = "amux-runtime"
 version = "0.1.0-alpha.2"
 edition = "2024"
+authors = ["win5do"]
 license = "MIT OR Apache-2.0"
-description = "Persistent process and TTY runtime for AI agents"
+description = "Persistent process and TTY runtime for AI agents, with durable logs and human attach"
 repository = "https://github.com/win5do/amux"
 documentation = "https://docs.rs/amux-runtime"
 readme = "README.md"
