@@ -110,6 +110,10 @@ just lint
 just build
 ```
 
+Treefold consumes `amux-runtime`, the `amux` CLI, and `skills/amux` from one
+resolved checkout. For development across arbitrary worktree paths, see
+[Treefold integration](docs/treefold-development.md).
+
 Linux and macOS are supported. The first runtime driver is `host`. Persistence
 covers Treefold/CLI reconnects. Stopping or losing a daemon deliberately stops
 all of its group shims and business process groups.
