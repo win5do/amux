@@ -1,11 +1,15 @@
 ---
 name: amux
-description: Run and manage persistent processes and TTYs with the `amux` CLI, including starting workspace services, listing or inspecting processes, reading or following logs, attaching to terminals, signaling, stopping, restarting, waiting for, and removing processes. Use for debug servers, build watchers, test runners, shells, or other long-lived commands, including inside Treefold-managed Sessions that provide `AMUX_SOCKET` and `AMUX_WORKSPACE`.
+description: Run persistent services and watchers, or processes whose logs the user needs to follow or retain independently, with the `amux` CLI. Inspect and control managed processes, logs, and TTYs, including in Treefold Sessions. Ordinary one-shot tests, builds, checks, scripts, and temporary commands should use the Agent's normal execution tool.
 ---
 
 # amux
 
-Use amux as the process runtime. Prefer it for long-lived commands whose logs or lifecycle must survive the invoking shell or Agent turn.
+Use amux for persistent services or watchers that should keep running across Agent turns, or when the user needs to follow or retain a process's logs independently of the Agent's command output.
+
+Run one-shot tests, builds, lint/type checks, scripts, and temporary diagnostics directly with the Agent's normal execution tool. A command taking a long time, needing a TTY, or inheriting Treefold/amux environment variables does not by itself require management. An ongoing test watch session belongs in amux; a normal test run does not unless the user needs that independent log access.
+
+Apply the following workflow only when starting or managing a process that needs amux.
 
 ## Select the runtime
 
@@ -35,16 +39,16 @@ amux run --name api -- cargo run
 amux run --name web -- npm run dev
 ```
 
-Use `--tty` when terminal semantics are required regardless of the inherited default:
+For a managed process, use `--tty` when terminal semantics are required regardless of the inherited default:
 
 ```bash
 amux run --name repl --tty -- python
 ```
 
-Use `--io-mode pipe` explicitly when separate stdout/stderr pipes are required:
+For a managed process, use `--io-mode pipe` explicitly when separate stdout/stderr pipes are required:
 
 ```bash
-amux run --name batch --io-mode pipe -- ./batch-job
+amux run --name api --io-mode pipe -- cargo run
 ```
 
 Choose stable, descriptive names. Do not use amux as a second child-Agent orchestrator when the active Agent already provides delegation.
