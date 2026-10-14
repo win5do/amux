@@ -1,5 +1,7 @@
 # amux
 
+English | [简体中文](README.zh-CN.md)
+
 `amux` is a persistent process and TTY runtime for AI agents, with durable logs
 and human attach. It is implemented entirely in Rust.
 
