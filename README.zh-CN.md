@@ -84,8 +84,6 @@ just lint
 just build
 ```
 
-Treefold 从同一份解析后的源码检出目录使用 `amux-runtime`、`amux` CLI 和 `skills/amux`。如需在任意 worktree 路径下协同开发，请参阅 [Treefold 集成](docs/treefold-development.md)。
-
 支持 Linux 和 macOS。首个运行时驱动为 `host`。持久化能力支持 Treefold 和 CLI 重新连接；守护进程停止或意外退出时，系统会按设计停止其全部 group shim 和业务进程组。
 
 ## 许可证
