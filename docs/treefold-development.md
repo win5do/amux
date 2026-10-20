@@ -1,7 +1,7 @@
 # Developing amux with Treefold
 
-Treefold's default dependency is this repository's GitHub `main` branch. Its
-backend `Cargo.lock` pins the exact commit; ordinary builds do not update main.
+Treefold's default dependency is a full GitHub commit declared by `rev` in its
+backend `Cargo.toml` and pinned in `Cargo.lock`; ordinary builds do not update it.
 The runtime library, bundled CLI, and `skills/amux` must all come from that same
 checkout. Keep the `amux-runtime` package name, `amux` library/binary targets,
 and `skills/amux/SKILL.md` available together when changing this integration.
@@ -36,10 +36,11 @@ do not apply `TREEFOLD_AMUX_MANIFEST`; Treefold rejects them when it is set.
 The override does not alter ordinary Cargo commands in the amux repository.
 
 Unset `TREEFOLD_AMUX_MANIFEST` and rebuild to return to the locked Git source.
-To advance that default dependency, run in Treefold:
+To advance that default dependency, first push the amux commit and set Treefold's
+`src/backend/Cargo.toml` dependency `rev` to its full hash, then run in Treefold:
 
 ```sh
 cargo update --manifest-path src/backend/Cargo.toml -p amux-runtime
 ```
 
-Commit the resulting Treefold lockfile change after verifying the new revision.
+Commit the manifest and resulting lockfile change after verifying the new revision.

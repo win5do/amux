@@ -64,6 +64,10 @@ amux workspace rm dev
 - `AMUX_LOG`：守护进程和 shim 诊断日志的 tracing 过滤器，优先于 `RUST_LOG`，默认为 `amux=info`。
 - 状态目录权限为 `0700`；socket 和状态文件权限为 `0600`。
 
+具名守护进程的 socket 由规范化后的绝对数据根目录和守护进程名称共同确定，因此不同的 `AMUX_STATE_DIR` 可以各自使用 `default`。指向同一根目录的相对路径和已有符号链接会选择同一个 socket。socket 仍放在 `XDG_RUNTIME_DIR` 或系统临时目录下，以保持路径简短。显式设置 `AMUX_SOCKET` 时仍直接使用指定地址。
+
+从仅按名称生成 socket 的旧版升级时，需要先用旧版程序停止运行中的守护进程，再启动新版。socket 地址变化不会迁移或删除已有元数据和日志；原有状态锁会阻止新版同时打开旧版仍占用的数据。停止守护进程也会停止它管理的进程。
+
 `amux daemon rm <name>` 会永久删除指定守护进程的全部持久化状态。该命令只能在守护进程停止后执行；如果状态已不存在，重复执行也不会报错。它不会按需启动或连接守护进程。
 
 进程输出存储在当前使用的 `output/current/` 目录，以及以 UTC 时间戳命名的 `output/<timestamp>.bak/` 历史目录中。每一代目录都包含原始流文件和对应的 `events.jsonl`，因此事件偏移量始终指向同一目录内的文件。`amux logs` 按从旧到新的顺序读取保留的日志。当 `--after` 指向已丢弃的历史记录时，JSONL 输出会包含一条 `gap` 记录；纯文本输出会先在 stderr 报告缺口，再从最早保留的输出继续读取。`amuxd.log` 和工作区的 `shim.log` 使用相同的大小与备份数量策略，备份文件名为 `<name>.<timestamp>.bak`。

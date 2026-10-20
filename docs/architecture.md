@@ -13,6 +13,11 @@ amux -> amuxd -> workspace group shim -> per-process supervisor -> OS process gr
 The state tree uses the schema-v1 JSON layout from the original Go
 implementation. Durable files live below `AMUX_STATE_DIR`; short shim socket
 paths live below `/tmp/amux-UID/shims` to fit macOS `sockaddr_un` limits.
+Daemon socket names hash the normalized absolute state directory (including the
+daemon name digest), and live in `XDG_RUNTIME_DIR` or the system temporary
+directory. Different state roots therefore cannot share a named daemon socket.
+Existing path prefixes are canonicalized before missing directories are appended,
+so first startup, relative paths, and existing symlink aliases keep one identity.
 
 Each output stream has one authoritative reader. The shim appends bytes to the
 raw stream log, appends a monotonically sequenced event to `events.jsonl`, then

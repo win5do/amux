@@ -79,6 +79,18 @@ Configuration:
   over `RUST_LOG` and defaults to `amux=info`.
 - State directories are mode `0700`; sockets and state files are mode `0600`.
 
+Named daemon sockets are scoped to the normalized absolute state root and daemon
+name, so separate `AMUX_STATE_DIR` roots can each use `default`. Relative paths
+and existing symlink aliases of the same root select the same socket. Sockets
+remain in `XDG_RUNTIME_DIR` or the system temporary directory to keep paths short.
+An explicit `AMUX_SOCKET` still selects that exact endpoint.
+
+When upgrading from name-only socket addressing, stop running daemons with the
+old binary before starting the new binary. The new socket address does not
+change stored metadata or logs; the existing state lock prevents a second daemon
+from opening state still owned by an old daemon. Stopping a daemon also stops
+its managed processes.
+
 `amux daemon rm <name>` permanently deletes all persistent state for a named
 daemon. It is accepted only after that daemon has stopped, is idempotent when
 the state is already absent, and does not lazily start or connect to a daemon.

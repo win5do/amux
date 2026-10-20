@@ -226,6 +226,8 @@ fn daemon_with_env(state: &Path, socket: &Path, env: &[(&str, &str)]) -> Child {
 
 fn named_amux(state: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_amux"))
+        .env_remove("AMUX_SOCKET")
+        .env_remove("AMUX_DAEMON")
         .env("AMUX_STATE_DIR", state)
         .args(args)
         .output()
@@ -1271,6 +1273,112 @@ async fn group_reuse_parent_links_and_process_events() {
     }));
     daemon_process.kill().unwrap();
     let _ = daemon_process.wait();
+}
+
+#[tokio::test]
+async fn default_daemons_in_different_state_roots_are_isolated() {
+    let _guard = E2E_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let first_root = temp.path().join("first");
+    let second_root = temp.path().join("second");
+    let first = Config::named(&first_root, "default").unwrap();
+    let second = Config::named(&second_root, "default").unwrap();
+    assert_ne!(first.socket, second.socket);
+    let _first = OwnedDaemon(daemon_with_env(
+        &first.state_dir,
+        &first.socket,
+        &[("AMUX_DAEMON", "default")],
+    ));
+    let _second = OwnedDaemon(daemon_with_env(
+        &second.state_dir,
+        &second.socket,
+        &[("AMUX_DAEMON", "default")],
+    ));
+    for (root, workspace) in [(&first_root, "first-only"), (&second_root, "second-only")] {
+        let output = named_amux(root, &["workspace", "create", workspace]);
+        assert!(output.status.success(), "{output:?}");
+        let listing = named_amux(root, &["--json", "workspace", "ls"]);
+        assert!(listing.status.success(), "{listing:?}");
+        let listing = String::from_utf8(listing.stdout).unwrap();
+        assert!(listing.contains(workspace));
+        assert!(!listing.contains(if workspace == "first-only" {
+            "second-only"
+        } else {
+            "first-only"
+        }));
+    }
+    let stopped = named_amux(&first_root, &["daemon", "stop"]);
+    assert!(stopped.status.success(), "{stopped:?}");
+    let removed = named_amux(&first_root, &["daemon", "rm", "default"]);
+    assert!(removed.status.success(), "{removed:?}");
+    assert!(!first.state_dir.exists());
+    assert!(!first.socket.exists());
+    let status = named_amux(&second_root, &["daemon", "status"]);
+    assert!(status.status.success(), "{status:?}");
+    let listing = named_amux(&second_root, &["--json", "workspace", "ls"]);
+    assert!(listing.status.success(), "{listing:?}");
+    assert!(
+        String::from_utf8(listing.stdout)
+            .unwrap()
+            .contains("second-only")
+    );
+    let stopped = named_amux(&second_root, &["daemon", "stop"]);
+    assert!(stopped.status.success(), "{stopped:?}");
+}
+
+#[tokio::test]
+async fn socket_address_change_requires_stopping_the_existing_state_owner() {
+    let _guard = E2E_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("state");
+    let config = Config::named(&root, "default").unwrap();
+    // Simulate an older daemon holding the same state at a different address.
+    let old_socket = temp.path().join("old.sock");
+    let mut old = OwnedDaemon(daemon_with_env(
+        &config.state_dir,
+        &old_socket,
+        &[("AMUX_DAEMON", "default")],
+    ));
+    ok(
+        &config.state_dir,
+        &old_socket,
+        &["workspace", "create", "retained"],
+    );
+    let attempt = named_amux(&root, &["workspace", "ls"]);
+    assert!(!attempt.status.success(), "{attempt:?}");
+    assert!(!config.socket.exists());
+    assert!(old.0.try_wait().unwrap().is_none());
+    assert!(
+        ok(
+            &config.state_dir,
+            &old_socket,
+            &["--json", "workspace", "ls"],
+        )
+        .contains("retained")
+    );
+    Client::new(Config {
+        state_dir: config.state_dir.clone(),
+        socket: old_socket,
+    })
+    .do_empty(http::Method::POST, "/v1/admin/stop")
+    .await
+    .unwrap();
+    assert!(old.0.wait().unwrap().success());
+
+    let _new = OwnedDaemon(daemon_with_env(
+        &config.state_dir,
+        &config.socket,
+        &[("AMUX_DAEMON", "default")],
+    ));
+    let listing = named_amux(&root, &["--json", "workspace", "ls"]);
+    assert!(listing.status.success(), "{listing:?}");
+    assert!(
+        String::from_utf8(listing.stdout)
+            .unwrap()
+            .contains("retained")
+    );
+    let stopped = named_amux(&root, &["daemon", "stop"]);
+    assert!(stopped.status.success(), "{stopped:?}");
 }
 
 #[tokio::test]

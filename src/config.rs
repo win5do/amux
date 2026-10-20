@@ -1,6 +1,7 @@
 use std::{
     env,
-    path::{Path, PathBuf},
+    os::unix::ffi::OsStrExt,
+    path::{Component, Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
@@ -27,11 +28,18 @@ impl Config {
     pub fn named(root: impl AsRef<Path>, name: &str) -> Result<Self> {
         validate_daemon_name(name)?;
         let digest = daemon_digest(name);
-        let state_dir = root.as_ref().join("daemons").join(&digest);
+        let state_dir = normalize_state_root(root.as_ref())?
+            .join("daemons")
+            .join(&digest);
+        // Keep the socket short while giving every data root its own namespace.
+        // Preserve the existing on-disk daemon directory layout.
+        let socket_digest = short_digest(state_dir.as_os_str().as_bytes());
         let runtime = env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
-        let socket = runtime.join(format!("amux-{}-{digest}.sock", unsafe { libc::getuid() }));
+        let socket = runtime.join(format!("amux-{}-{socket_digest}.sock", unsafe {
+            libc::getuid()
+        }));
         Ok(Self { state_dir, socket })
     }
 
@@ -47,6 +55,32 @@ impl Config {
             .to_string_lossy();
         Ok(parent.join(format!(".{name}.lock")))
     }
+}
+
+fn normalize_state_root(root: &Path) -> Result<PathBuf> {
+    let absolute = std::path::absolute(root).context("resolve state root")?;
+    let mut normalized = PathBuf::new();
+    // Resolve existing prefixes, including symlinks, before appending missing
+    // directories. The identity must not change when first startup creates them.
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => {
+                normalized.push(component.as_os_str());
+                match normalized.canonicalize() {
+                    Ok(path) => normalized = path,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error).context("normalize state root");
+                    }
+                }
+            }
+        }
+    }
+    Ok(normalized)
 }
 
 pub fn state_root() -> Result<PathBuf> {
@@ -83,7 +117,11 @@ pub fn validate_daemon_name(name: &str) -> Result<()> {
 }
 
 pub fn daemon_digest(name: &str) -> String {
-    let digest = Sha256::digest(name.as_bytes());
+    short_digest(name.as_bytes())
+}
+
+fn short_digest(value: &[u8]) -> String {
+    let digest = Sha256::digest(value);
     digest[..12].iter().map(|v| format!("{v:02x}")).collect()
 }
 
@@ -111,4 +149,45 @@ pub fn boot_id() -> String {
         }
     }
     "unknown".to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn named_daemons_are_scoped_to_the_state_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = Config::named(temp.path().join("first"), "default").unwrap();
+        let second = Config::named(temp.path().join("second"), "default").unwrap();
+        assert_ne!(first.socket, second.socket);
+        assert_ne!(
+            first.socket,
+            Config::named(temp.path().join("first"), "other")
+                .unwrap()
+                .socket
+        );
+    }
+
+    #[test]
+    fn state_root_identity_survives_creation_and_path_aliases() {
+        let temp = tempfile::tempdir_in(env::current_dir().unwrap()).unwrap();
+        let root = temp.path().join("missing/state");
+        let before = Config::named(&root, "default").unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(temp.path().join("missing"), &alias).unwrap();
+        for path in [
+            root.clone(),
+            root.strip_prefix(env::current_dir().unwrap())
+                .unwrap()
+                .to_path_buf(),
+            alias.join("./state"),
+            root.join("../state"),
+        ] {
+            let config = Config::named(path, "default").unwrap();
+            assert_eq!(before.socket, config.socket);
+            assert_eq!(before.state_dir, config.state_dir);
+        }
+    }
 }
