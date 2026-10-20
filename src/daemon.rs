@@ -149,6 +149,14 @@ impl Daemon {
     }
 
     pub async fn serve(self, ready_fd: Option<i32>) -> Result<()> {
+        let recovery =
+            crate::lifecycle::lock(&crate::lifecycle::recovery_path(&self.config)?, false, true)?
+                .ok_or_else(|| {
+                crate::protocol::ApiError::new(
+                    "daemon_recovering",
+                    "Runtime recovery is in progress",
+                )
+            })?;
         let parent = self
             .config
             .socket
@@ -166,7 +174,7 @@ impl Daemon {
             .context("state directory has no parent")?;
         fs::create_dir_all(state_parent)?;
         let lock_path = self.config.lock_path()?;
-        let lock = OpenOptions::new()
+        let mut lock = OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
@@ -182,6 +190,11 @@ impl Daemon {
         {
             bail!("another amuxd owns the socket")
         }
+        if self.config.state_dir.join("recovery-pending.json").exists() {
+            bail!("runtime recovery is incomplete; run daemon recover before starting");
+        }
+        crate::lifecycle::record_lock_owner(&mut lock, &self.instance_id)?;
+        drop(recovery);
         self.store.ensure_schema()?;
         if !self.embedded_shims {
             install_process_log(self.config.state_dir.join("amuxd.log"), self.log_config)?;
@@ -211,11 +224,10 @@ impl Daemon {
         }
         let listener = UnixListener::bind(&self.config.socket)?;
         fs::set_permissions(&self.config.socket, fs::Permissions::from_mode(0o600))?;
+        self.write_registration()?;
         if let Some(fd) = ready_fd {
             write_ready(fd);
         }
-
-        self.write_registration()?;
         info!(socket = %self.config.socket.display(), "daemon ready");
         let monitor = self.clone();
         tokio::spawn(async move { monitor.consistency_loop().await });
@@ -599,6 +611,7 @@ impl Daemon {
                 "name": std::env::var("AMUX_DAEMON").unwrap_or_else(|_| "default".into()),
                 "instance_id": self.instance_id.as_str(),
                 "pid": std::process::id(),
+                "process_identity": crate::process_identity::ProcessIdentity::current(std::process::id() as i32)?,
                 "socket": self.config.socket,
                 "state_dir": self.config.state_dir,
                 "version": env!("CARGO_PKG_VERSION"),

@@ -19,6 +19,20 @@ directory. Different state roots therefore cannot share a named daemon socket.
 Existing path prefixes are canonicalized before missing directories are appended,
 so first startup, relative paths, and existing symlink aliases keep one identity.
 
+Daemon registration includes the OS process identity (PID, UID, boot ID, start
+identity, and process group). The same instance/identity pair is written into
+the state lock inode while holding `flock`; recovery checks both records and
+the live OS identity before signaling. Registration alone is not authority to
+kill a process. macOS uses `proc_pidinfo`; Linux uses `/proc/<pid>/stat`.
+
+`lifecycle` owns bounded inspection and explicit recovery. A separate recovery
+lock serializes recovery and excludes daemon startup/removal while cleanup is
+in progress. A durable `recovery-pending.json` prevents ordinary startup after
+interrupted cleanup. The shim lifeline handles daemon death; recovery verifies
+managed group termination and checks persisted shim/process identities before
+any additional signals. Legacy records remain readable but cannot authorize
+forced termination without the new ownership evidence.
+
 Each output stream has one authoritative reader. The shim appends bytes to the
 raw stream log, appends a monotonically sequenced event to `events.jsonl`, then
 broadcasts it. Dirty raw streams and their event index are synced in that order

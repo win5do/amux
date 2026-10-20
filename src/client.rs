@@ -1,5 +1,6 @@
 use std::{
     fs::OpenOptions,
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
     os::unix::{
         fs::{OpenOptionsExt, PermissionsExt},
         process::CommandExt,
@@ -25,7 +26,81 @@ pub struct Client {
     daemon_name: String,
 }
 
+struct StartingDaemon {
+    child: std::process::Child,
+    ready: bool,
+}
+
+impl Drop for StartingDaemon {
+    fn drop(&mut self) {
+        if !self.ready {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
 impl Client {
+    pub fn daemon_name(&self) -> &str {
+        &self.daemon_name
+    }
+
+    pub async fn health(&self) -> crate::lifecycle::Health {
+        use crate::lifecycle::{HEALTH_TIMEOUT, Health};
+        match tokio::time::timeout(HEALTH_TIMEOUT, self.do_empty(Method::GET, "/v1/health")).await {
+            Err(_) => Health::Timeout,
+            Ok(Err(error)) => {
+                if error.chain().any(|cause| {
+                    cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                        matches!(
+                            io.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                        )
+                    })
+                }) {
+                    Health::Unreachable {
+                        message: error.to_string(),
+                    }
+                } else {
+                    Health::InvalidResponse {
+                        message: error.to_string(),
+                    }
+                }
+            }
+            Ok(Ok(bytes)) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                Ok(value)
+                    if value["ok"] == true
+                        && value["daemon_instance_id"]
+                            .as_str()
+                            .is_some_and(|id| !id.is_empty()) =>
+                {
+                    Health::Healthy {
+                        instance_id: value["daemon_instance_id"].as_str().unwrap().into(),
+                    }
+                }
+                _ => Health::InvalidResponse {
+                    message: "Invalid daemon health response".into(),
+                },
+            },
+        }
+    }
+
+    pub async fn runtime_status(&self) -> Result<crate::lifecycle::RuntimeStatus> {
+        crate::lifecycle::inspect(self).await
+    }
+
+    pub async fn recover_daemon_with(
+        &self,
+        executable: PathBuf,
+        arguments: Vec<String>,
+    ) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(45), async {
+            crate::lifecycle::recover(self).await?;
+            self.ensure_daemon_with(executable, arguments).await
+        })
+        .await
+        .context("daemon recovery timed out")?
+    }
     pub fn new(config: Config) -> Self {
         Self {
             config,
@@ -100,7 +175,7 @@ impl Client {
     }
 
     pub async fn ready(&self) -> bool {
-        self.do_empty(Method::GET, "/v1/health").await.is_ok()
+        self.health().await.healthy()
     }
 
     pub async fn ensure_daemon(&self) -> Result<()> {
@@ -114,9 +189,22 @@ impl Client {
         executable: PathBuf,
         arguments: Vec<String>,
     ) -> Result<()> {
-        if self.ready().await {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            self.start_daemon(executable, arguments),
+        )
+        .await
+        .context("daemon startup timed out")?
+    }
+
+    async fn start_daemon(&self, executable: PathBuf, arguments: Vec<String>) -> Result<()> {
+        let status = self.runtime_status().await?;
+        if status.state == crate::lifecycle::RuntimeState::Healthy {
             debug!(daemon_name = %self.daemon_name, "daemon already ready");
             return Ok(());
+        }
+        if status.state != crate::lifecycle::RuntimeState::Stopped {
+            return Err(crate::lifecycle::unavailable(&status));
         }
         std::fs::create_dir_all(&self.config.state_dir)?;
         std::fs::set_permissions(
@@ -133,6 +221,8 @@ impl Client {
         if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
+        let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
         let mut command = Command::new(executable);
         command
             .args(arguments)
@@ -144,35 +234,33 @@ impl Client {
             .stdout(log)
             .stderr(stderr);
         unsafe {
-            command.pre_exec(|| {
+            command.pre_exec(move || {
+                libc::close(fds[0]);
                 if libc::setsid() == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
             });
         }
-        let mut child = command.spawn()?;
-        debug!(daemon_name = %self.daemon_name, pid = child.id(), "daemon spawned; waiting for readiness");
-        unsafe {
-            libc::close(fds[1]);
-        }
-        let read_fd = fds[0];
+        let mut child = StartingDaemon {
+            child: command.spawn()?,
+            ready: false,
+        };
+        debug!(daemon_name = %self.daemon_name, pid = child.child.id(), "daemon spawned; waiting for readiness");
+        drop(write_fd);
         let ready = tokio::task::spawn_blocking(move || {
             let mut byte = [0u8; 1];
             let mut poll = libc::pollfd {
-                fd: read_fd,
+                fd: read_fd.as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             };
             let polled = unsafe { libc::poll(&mut poll, 1, 5_000) };
             let n = if polled > 0 {
-                unsafe { libc::read(read_fd, byte.as_mut_ptr().cast(), 1) }
+                unsafe { libc::read(read_fd.as_raw_fd(), byte.as_mut_ptr().cast(), 1) }
             } else {
                 0
             };
-            unsafe {
-                libc::close(read_fd);
-            }
             n == 1
         });
         let ok = tokio::time::timeout(Duration::from_secs(5), ready)
@@ -180,10 +268,9 @@ impl Client {
             .context("daemon readiness timeout")??;
         if !ok && !self.ready().await {
             warn!(daemon_name = %self.daemon_name, "daemon readiness failed");
-            let _ = child.kill();
-            let _ = child.wait();
             bail!("daemon readiness failed")
         }
+        child.ready = true;
         Ok(())
     }
 }

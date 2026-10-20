@@ -85,11 +85,29 @@ and existing symlink aliases of the same root select the same socket. Sockets
 remain in `XDG_RUNTIME_DIR` or the system temporary directory to keep paths short.
 An explicit `AMUX_SOCKET` still selects that exact endpoint.
 
-When upgrading from name-only socket addressing, stop running daemons with the
-old binary before starting the new binary. The new socket address does not
-change stored metadata or logs; the existing state lock prevents a second daemon
-from opening state still owned by an old daemon. Stopping a daemon also stops
-its managed processes.
+Health checks have a one-second deadline and retry once before classifying an
+unavailable runtime. `amux daemon status <name> --json` reports `healthy`,
+`stopped`, `unresponsive`, or `legacy`, along with the probe result and whether
+recovery can verify the owner. Normal startup never kills an existing daemon.
+
+To explicitly recover an unresponsive runtime, run `amux daemon recover <name>`
+from an external terminal with the same `AMUX_STATE_DIR` root. This stops that
+daemon's terminals, agents, and services and starts a new daemon; saved state and
+logs remain. Recovery first requests normal shutdown when possible, then uses
+SIGTERM and, after a deadline, SIGKILL only for a verified lock owner. It checks
+the instance ID, UID, boot ID, and OS process start identity instead of trusting
+a PID alone, and waits for managed processes and shims to exit. Concurrent
+recovery is rejected. An interrupted recovery must finish cleanup before normal
+startup can continue. Startup and recovery have overall deadlines of 10 and
+45 seconds respectively.
+Recorded process exit results are preserved. If a shim died before recording an
+exit result, recovery marks that execution failed instead of leaving it running.
+
+When upgrading from name-only socket addressing, a healthy old endpoint recorded
+in this data directory is reported as `legacy`. Explicit recovery can stop it
+normally and switch to the new socket without moving metadata or logs. An old,
+unresponsive daemon without verifiable ownership records must be stopped
+manually; recovery will not guess which process to kill.
 
 `amux daemon rm <name>` permanently deletes all persistent state for a named
 daemon. It is accepted only after that daemon has stopped, is idempotent when

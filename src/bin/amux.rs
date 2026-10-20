@@ -118,6 +118,10 @@ enum DaemonCommand {
     Stop {
         name: Option<String>,
     },
+    /// Recover an unresponsive daemon, terminating its managed tasks.
+    Recover {
+        name: Option<String>,
+    },
     /// Permanently remove all state for a stopped daemon.
     Rm {
         name: String,
@@ -470,16 +474,56 @@ async fn run_daemon_command(
         DaemonCommand::Status { name } => {
             let name = name.as_deref().unwrap_or(selected);
             let client = Client::named(Config::named(amux::config::state_root()?, name)?, name);
-            if !client.ready().await {
-                anyhow::bail!("daemon {name} is not running")
+            let status = client.runtime_status().await?;
+            if json {
+                let instance_id = match &status.health {
+                    amux::lifecycle::Health::Healthy { instance_id } => Some(instance_id),
+                    _ => None,
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "ok": status.state == amux::lifecycle::RuntimeState::Healthy,
+                        "daemon_instance_id": instance_id, "schema_version": amux::model::SCHEMA_VERSION,
+                        "name": name, "runtime": status
+                    }))?
+                );
+                return Ok(());
             }
+            if status.state != amux::lifecycle::RuntimeState::Healthy {
+                println!("{name}: {:?} ({:?})", status.state, status.health);
+                return Ok(());
+            }
+            print_daemon_status(&client, name, json).await
+        }
+        DaemonCommand::Recover { name } => {
+            let name = name.as_deref().unwrap_or(selected);
+            let client = Client::named(Config::named(amux::config::state_root()?, name)?, name);
+            client
+                .recover_daemon_with(
+                    std::env::current_exe()?,
+                    vec!["daemon".into(), "serve".into()],
+                )
+                .await?;
             print_daemon_status(&client, name, json).await
         }
         DaemonCommand::Stop { name } => {
             let name = name.as_deref().unwrap_or(selected);
             let client = Client::named(Config::named(amux::config::state_root()?, name)?, name);
-            if client.ready().await {
-                client.do_empty(Method::POST, "/v1/admin/stop").await?;
+            let status = client.runtime_status().await?;
+            if !matches!(
+                status.state,
+                amux::lifecycle::RuntimeState::Healthy | amux::lifecycle::RuntimeState::Stopped
+            ) {
+                return Err(amux::lifecycle::unavailable(&status));
+            }
+            if status.state == amux::lifecycle::RuntimeState::Healthy {
+                tokio::time::timeout(
+                    Duration::from_secs(3),
+                    client.do_empty(Method::POST, "/v1/admin/stop"),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("daemon stop request timed out"))??;
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
                 while client.config.socket.exists() && tokio::time::Instant::now() < deadline {
                     tokio::time::sleep(Duration::from_millis(25)).await;
@@ -527,6 +571,7 @@ async fn run_daemon_command(
 
 fn remove_daemon(name: &str, json: bool) -> anyhow::Result<()> {
     let config = Config::named(amux::config::state_root()?, name)?;
+    let _recovery = amux::lifecycle::lock_for_removal(&config)?;
     let lock_path = config.lock_path()?;
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent)?;
@@ -578,7 +623,12 @@ fn remove_daemon(name: &str, json: bool) -> anyhow::Result<()> {
 }
 
 async fn print_daemon_status(client: &Client, name: &str, json: bool) -> anyhow::Result<()> {
-    let bytes = client.do_empty(Method::GET, "/v1/health").await?;
+    let bytes = tokio::time::timeout(
+        amux::lifecycle::HEALTH_TIMEOUT,
+        client.do_empty(Method::GET, "/v1/health"),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("daemon health request timed out"))??;
     if json {
         println!("{}", String::from_utf8_lossy(&bytes));
     } else {

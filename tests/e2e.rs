@@ -217,7 +217,9 @@ fn daemon_with_env(state: &Path, socket: &Path, env: &[(&str, &str)]) -> Child {
         .stderr(Stdio::null());
     let child = command.spawn().unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while std::os::unix::net::UnixStream::connect(socket).is_err() {
+    while std::os::unix::net::UnixStream::connect(socket).is_err()
+        || !state.join("daemon.json").exists()
+    {
         assert!(Instant::now() < deadline, "daemon socket was not ready");
         thread::sleep(Duration::from_millis(20));
     }
@@ -1669,4 +1671,407 @@ fn rotating_backup_count(dir: &Path, active: &str) -> usize {
             name.starts_with(&prefix) && name.ends_with(".bak")
         })
         .count()
+}
+
+#[tokio::test]
+async fn unresponsive_daemon_recovery_is_bounded_serialized_and_cleans_children() {
+    use amux::lifecycle::{Health, RuntimeState};
+    use amux::process_identity::ProcessIdentity;
+    let _guard = E2E_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("state");
+    let config = Config::named(&root, "default").unwrap();
+    let mut owner = OwnedDaemon(daemon_with_env(
+        &config.state_dir,
+        &config.socket,
+        &[("AMUX_DAEMON", "default")],
+    ));
+    ok(
+        &config.state_dir,
+        &config.socket,
+        &["workspace", "create", "dev"],
+    );
+    let run = ok(
+        &config.state_dir,
+        &config.socket,
+        &[
+            "--json",
+            "run",
+            "--workspace",
+            "dev",
+            "--name",
+            "stubborn",
+            "--",
+            "/bin/sh",
+            "-c",
+            "trap '' TERM; sleep 60",
+        ],
+    );
+    let value: serde_json::Value = serde_json::from_str(&run).unwrap();
+    let process = &value["process"];
+    let pid = process["pid"].as_i64().unwrap() as i32;
+    let child_identity = ProcessIdentity::current(pid).unwrap().unwrap();
+    assert_eq!(unsafe { libc::kill(owner.0.id() as i32, libc::SIGSTOP) }, 0);
+    let client = Client::named(config.clone(), "default");
+    let started = Instant::now();
+    let status = client.runtime_status().await.unwrap();
+    assert_eq!(status.state, RuntimeState::Unresponsive);
+    assert_eq!(status.health, Health::Timeout);
+    assert!(status.recovery_available);
+    assert!(started.elapsed() < Duration::from_secs(4));
+    assert!(
+        client
+            .ensure_daemon_with(
+                env!("CARGO_BIN_EXE_amux").into(),
+                vec!["daemon".into(), "serve".into()]
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("daemon_unresponsive")
+    );
+    let recovery = client.recover_daemon_with(
+        env!("CARGO_BIN_EXE_amux").into(),
+        vec!["daemon".into(), "serve".into()],
+    );
+    let concurrent = async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        client
+            .recover_daemon_with(
+                env!("CARGO_BIN_EXE_amux").into(),
+                vec!["daemon".into(), "serve".into()],
+            )
+            .await
+            .unwrap_err()
+    };
+    let (result, busy) = tokio::join!(recovery, concurrent);
+    assert!(busy.to_string().contains("daemon_recovering"));
+    result.unwrap();
+    owner.0.wait().unwrap();
+    assert!(!child_identity.alive().unwrap());
+    assert!(client.ready().await);
+    let snapshot: amux::model::ProcessSnapshot = serde_json::from_slice(
+        &client
+            .do_empty(http::Method::GET, "/v1/processes/snapshot")
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(snapshot.processes.len(), 1);
+    assert!(snapshot.processes[0].process.state.terminal());
+    assert!(snapshot.processes[0].process.finished_at.is_some());
+    assert!(named_amux(&root, &["daemon", "stop"]).status.success());
+}
+
+#[tokio::test]
+async fn recovery_refuses_mismatched_process_identity() {
+    let _guard = E2E_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("state");
+    let config = Config::named(&root, "default").unwrap();
+    let owner = OwnedDaemon(daemon_with_env(
+        &config.state_dir,
+        &config.socket,
+        &[("AMUX_DAEMON", "default")],
+    ));
+    assert_eq!(unsafe { libc::kill(owner.0.id() as i32, libc::SIGSTOP) }, 0);
+    let path = config.state_dir.join("daemon.json");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    record["process_identity"]["started"] = "reused-pid".into();
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    let client = Client::named(config, "default");
+    let status = client.runtime_status().await.unwrap();
+    assert!(!status.recovery_available);
+    let error = client
+        .recover_daemon_with(
+            env!("CARGO_BIN_EXE_amux").into(),
+            vec!["daemon".into(), "serve".into()],
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("identity"));
+    assert_eq!(unsafe { libc::kill(owner.0.id() as i32, 0) }, 0);
+    // A live, same-user PID with a valid start time still must own this lock.
+    let unrelated = OwnedDaemon(Command::new("/bin/sleep").arg("60").spawn().unwrap());
+    record["pid"] = (unrelated.0.id() as i32).into();
+    record["process_identity"] = serde_json::to_value(
+        amux::process_identity::ProcessIdentity::current(unrelated.0.id() as i32).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    assert!(!client.runtime_status().await.unwrap().recovery_available);
+    assert!(
+        client
+            .recover_daemon_with(
+                env!("CARGO_BIN_EXE_amux").into(),
+                vec!["daemon".into(), "serve".into()]
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(unsafe { libc::kill(unrelated.0.id() as i32, 0) }, 0);
+    assert_eq!(unsafe { libc::kill(owner.0.id() as i32, libc::SIGCONT) }, 0);
+    assert!(named_amux(&root, &["daemon", "stop"]).status.success());
+}
+
+#[tokio::test]
+async fn recovery_stops_a_healthy_registered_legacy_endpoint() {
+    let _guard = E2E_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("state");
+    let config = Config::named(&root, "default").unwrap();
+    let old_socket = temp.path().join("old.sock");
+    let mut old = OwnedDaemon(daemon_with_env(
+        &config.state_dir,
+        &old_socket,
+        &[("AMUX_DAEMON", "default")],
+    ));
+    ok(
+        &config.state_dir,
+        &old_socket,
+        &["workspace", "create", "legacy"],
+    );
+    ok(
+        &config.state_dir,
+        &old_socket,
+        &[
+            "run",
+            "--workspace",
+            "legacy",
+            "--name",
+            "busy",
+            "--",
+            "/bin/sh",
+            "-c",
+            "trap '' TERM; sleep 60",
+        ],
+    );
+    // A previous release can answer health and stop but has no recovery identity.
+    let registration = config.state_dir.join("daemon.json");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&registration).unwrap()).unwrap();
+    record.as_object_mut().unwrap().remove("process_identity");
+    amux::store::atomic_json(&registration, &record).unwrap();
+    let client = Client::named(config, "default");
+    assert_eq!(
+        client.runtime_status().await.unwrap().state,
+        amux::lifecycle::RuntimeState::Legacy
+    );
+    client
+        .recover_daemon_with(
+            env!("CARGO_BIN_EXE_amux").into(),
+            vec!["daemon".into(), "serve".into()],
+        )
+        .await
+        .unwrap();
+    assert!(old.0.wait().unwrap().success());
+    assert!(client.ready().await);
+    assert!(named_amux(&root, &["daemon", "stop"]).status.success());
+}
+
+#[tokio::test]
+async fn recovery_handles_missing_socket_but_does_not_cross_data_roots() {
+    let _guard = E2E_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("broken");
+    let other_root = temp.path().join("other");
+    let config = Config::named(&root, "default").unwrap();
+    let other_config = Config::named(&other_root, "default").unwrap();
+    let _other = OwnedDaemon(daemon_with_env(
+        &other_config.state_dir,
+        &other_config.socket,
+        &[("AMUX_DAEMON", "default")],
+    ));
+    let other = Client::named(other_config, "default");
+    let before = other.health().await;
+    let mut owner = OwnedDaemon(daemon_with_env(
+        &config.state_dir,
+        &config.socket,
+        &[("AMUX_DAEMON", "default")],
+    ));
+    assert_eq!(unsafe { libc::kill(owner.0.id() as i32, libc::SIGSTOP) }, 0);
+    std::fs::remove_file(&config.socket).unwrap();
+    let client = Client::named(config, "default");
+    let status = client.runtime_status().await.unwrap();
+    assert_eq!(status.state, amux::lifecycle::RuntimeState::Unresponsive);
+    assert!(matches!(
+        status.health,
+        amux::lifecycle::Health::Unreachable { .. }
+    ));
+    client
+        .recover_daemon_with(
+            env!("CARGO_BIN_EXE_amux").into(),
+            vec!["daemon".into(), "serve".into()],
+        )
+        .await
+        .unwrap();
+    owner.0.wait().unwrap();
+    assert_eq!(other.health().await, before);
+    assert!(named_amux(&root, &["daemon", "stop"]).status.success());
+    assert!(
+        named_amux(&other_root, &["daemon", "stop"])
+            .status
+            .success()
+    );
+}
+
+#[tokio::test]
+async fn stale_socket_and_lock_files_do_not_require_forced_recovery() {
+    let _guard = E2E_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("state");
+    let config = Config::named(&root, "default").unwrap();
+    std::fs::create_dir_all(&config.state_dir).unwrap();
+    std::fs::write(config.lock_path().unwrap(), "").unwrap();
+    drop(std::os::unix::net::UnixListener::bind(&config.socket).unwrap());
+    let client = Client::named(config, "default");
+    assert_eq!(
+        client.runtime_status().await.unwrap().state,
+        amux::lifecycle::RuntimeState::Stopped
+    );
+    client
+        .ensure_daemon_with(
+            env!("CARGO_BIN_EXE_amux").into(),
+            vec!["daemon".into(), "serve".into()],
+        )
+        .await
+        .unwrap();
+    assert!(client.ready().await);
+    assert!(named_amux(&root, &["daemon", "stop"]).status.success());
+}
+
+#[tokio::test]
+async fn interrupted_recovery_must_finish_cleanup_before_normal_startup() {
+    let _guard = E2E_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("state");
+    let config = Config::named(&root, "default").unwrap();
+    let marker = config.state_dir.join("recovery-pending.json");
+    let mut owner = OwnedDaemon(daemon_with_env(
+        &config.state_dir,
+        &config.socket,
+        &[("AMUX_DAEMON", "default")],
+    ));
+    unsafe {
+        libc::kill(owner.0.id() as i32, libc::SIGSTOP);
+    }
+    let client = Client::named(config, "default");
+    let worker = client.clone();
+    let recovery = tokio::spawn(async move {
+        worker
+            .recover_daemon_with(
+                env!("CARGO_BIN_EXE_amux").into(),
+                vec!["daemon".into(), "serve".into()],
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !marker.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    recovery.abort();
+    let _ = recovery.await;
+    owner.0.kill().unwrap();
+    owner.0.wait().unwrap();
+    let status = client.runtime_status().await.unwrap();
+    assert_eq!(status.state, amux::lifecycle::RuntimeState::Unresponsive);
+    assert!(status.recovery_available);
+    assert!(
+        client
+            .ensure_daemon_with(
+                env!("CARGO_BIN_EXE_amux").into(),
+                vec!["daemon".into(), "serve".into()]
+            )
+            .await
+            .is_err()
+    );
+    client
+        .recover_daemon_with(
+            env!("CARGO_BIN_EXE_amux").into(),
+            vec!["daemon".into(), "serve".into()],
+        )
+        .await
+        .unwrap();
+    assert!(!marker.exists());
+    assert!(client.ready().await);
+    assert!(named_amux(&root, &["daemon", "stop"]).status.success());
+}
+
+#[tokio::test]
+async fn recovery_of_an_uninitialized_runtime_does_not_leave_a_pending_marker() {
+    let _guard = E2E_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let config = Config::named(temp.path(), "default").unwrap();
+    let client = Client::named(config.clone(), "default");
+    client
+        .recover_daemon_with(
+            env!("CARGO_BIN_EXE_amux").into(),
+            vec!["daemon".into(), "serve".into()],
+        )
+        .await
+        .unwrap();
+    assert!(client.ready().await);
+    assert!(!config.state_dir.join("recovery-pending.json").exists());
+    assert!(
+        named_amux(temp.path(), &["daemon", "stop"])
+            .status
+            .success()
+    );
+}
+
+#[tokio::test]
+async fn health_distinguishes_invalid_protocol_from_a_stalled_response_body() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let temp = tempfile::tempdir().unwrap();
+    for stall in [false, true] {
+        let socket = temp
+            .path()
+            .join(if stall { "stall.sock" } else { "invalid.sock" });
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 4096];
+            let mut received = 0;
+            while !buffer[..received]
+                .windows(4)
+                .any(|part| part == b"\r\n\r\n")
+            {
+                let read = stream.read(&mut buffer[received..]).await.unwrap();
+                assert!(read > 0, "request ended before its headers");
+                received += read;
+                assert!(received < buffer.len(), "request headers exceeded buffer");
+            }
+            if stall {
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 999\r\n\r\n{")
+                    .await
+                    .unwrap();
+                std::future::pending::<()>().await;
+            } else {
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                    .await
+                    .unwrap();
+            }
+        });
+        let client = Client::new(Config {
+            state_dir: temp.path().join("state"),
+            socket,
+        });
+        let health = client.health().await;
+        if stall {
+            assert_eq!(health, amux::lifecycle::Health::Timeout);
+        } else {
+            assert!(matches!(
+                health,
+                amux::lifecycle::Health::InvalidResponse { .. }
+            ));
+        }
+        server.abort();
+        let _ = server.await;
+    }
 }

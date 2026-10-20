@@ -4,7 +4,7 @@ use std::{
     fs,
     io::{Read, Write},
     os::unix::{fs::PermissionsExt, process::CommandExt},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{Arc, Condvar, Mutex},
     time::Duration,
@@ -48,6 +48,14 @@ use crate::{
     output::{OutputFiles, OutputLog, OutputState, RecordReader},
     store::{atomic_json, read_json},
 };
+
+fn record_recovery_identity(path: &Path, pid: i32) {
+    let result = crate::process_identity::ProcessIdentity::current(pid)
+        .and_then(|identity| atomic_json(path, &identity));
+    if let Err(error) = result {
+        warn!(pid, %error, "process recovery identity unavailable");
+    }
+}
 
 const REPLAY_LIMIT: usize = 4 * 1024 * 1024;
 const ACKNOWLEDGED_INPUT_PROTOCOL: &str = "acked-v1";
@@ -147,6 +155,12 @@ impl GroupShim {
     }
 
     async fn serve_runtime(self, ready_fd: Option<i32>, lifecycle_fd: Option<i32>) -> Result<()> {
+        if lifecycle_fd.is_some() {
+            record_recovery_identity(
+                &self.workspace_dir.join("shim-identity.json"),
+                std::process::id() as i32,
+            );
+        }
         if let Some(parent) = self.socket.parent() {
             fs::create_dir_all(parent)?;
             fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
@@ -535,6 +549,7 @@ impl Shim {
         }
         let mut child = command.spawn().context("spawn process")?;
         let pid = child.id() as i32;
+        record_recovery_identity(&self.dir.join("identity.json"), pid);
         let stdin = child
             .stdin
             .take()
@@ -577,6 +592,7 @@ impl Shim {
         }
         let child = pair.slave.spawn_command(command)?;
         let pid = child.process_id().unwrap_or(0) as i32;
+        record_recovery_identity(&self.dir.join("identity.json"), pid);
         let reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
         {
